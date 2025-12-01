@@ -71,6 +71,20 @@ STATE_CHOICES = [
 ]
 STATE_NAME_TO_CODE = {name: code for name, code in STATE_CHOICES}
 STATE_CODE_TO_NAME = {code: name for name, code in STATE_CHOICES}
+FOCUS_PARTY_LOOKUP = {
+    "Legislator's Party": None,
+    "Democrat": "Democrat",
+    "Republican": "Republican",
+    "Independent": "Other",
+}
+FILTER_OPTIONS = [
+    "All Votes",
+    "Votes Against Party",
+    "Minority Votes",
+    "Deciding Votes",
+    "Skipped Votes",
+    "Search By Term",
+]
 
 
 def _resolve_archives(selected_names: List[str]) -> List[Path]:
@@ -141,6 +155,203 @@ def _collect_archives_for_states(state_codes: List[str]) -> List[str]:
     return selected
 
 
+def safe_int(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _apply_deciding_vote_filter(df: pd.DataFrame, max_vote_diff: int) -> pd.Series:
+    total_for = df["Total_For"].apply(safe_int)
+    total_against = df["Total_Against"].apply(safe_int)
+    vote_diff = (total_for - total_against).abs()
+    winning_bucket = pd.Series("Tie", index=df.index, dtype="object")
+    winning_bucket = winning_bucket.mask(total_for > total_against, "For")
+    winning_bucket = winning_bucket.mask(total_against > total_for, "Against")
+    df["Vote Difference"] = vote_diff
+    df["Winning Bucket"] = winning_bucket
+    return (
+        (vote_diff <= max_vote_diff)
+        & winning_bucket.isin(["For", "Against"])
+        & (df["Vote Bucket"] == winning_bucket)
+    )
+
+
+def apply_filters_json(
+    summary_df: pd.DataFrame,
+    *,
+    filter_mode: str,
+    search_term: str = "",
+    year_selection: Optional[List[int]] = None,
+    party_focus_option: str = "Legislator's Party",
+    minority_percent: int = 20,
+    min_group_votes: int = 0,
+    max_vote_diff: int = 5,
+) -> Tuple[pd.DataFrame, int]:
+    df = summary_df.copy()
+
+    if year_selection:
+        df = df[df["Year"].isin(year_selection)].copy()
+
+    if search_term:
+        description_mask = df["Bill Description"].astype(str).str.contains(
+            search_term, case=False, na=False
+        )
+        df = df[description_mask].copy()
+
+    if df.empty:
+        raise ValueError("No vote records found for the selected criteria.")
+
+    if filter_mode == "Search By Term" and not search_term:
+        raise ValueError("Enter a search term to use the 'Search By Term' vote type.")
+
+    if filter_mode == "Skipped Votes":
+        vote_text = df["Vote"].astype(str).str.strip().str.lower()
+        skip_mask = ~(
+            vote_text.str.startswith("yea")
+            | vote_text.str.startswith("nay")
+            | vote_text.str.startswith("aye")
+        )
+        df = df[skip_mask].copy()
+        if df.empty:
+            raise ValueError("No skipped votes found for the selected criteria.")
+
+    df["Roll Call ID"] = pd.to_numeric(df["Roll Call ID"], errors="coerce").astype("Int64")
+
+    def calc_metrics(row: pd.Series):
+        bucket = row["Vote Bucket"]
+        party = row["Person Party"]
+        metrics = {
+            "party_bucket_votes": None,
+            "party_total_votes": None,
+            "party_share": None,
+            "chamber_bucket_votes": None,
+            "chamber_total_votes": None,
+            "chamber_share": None,
+        }
+
+        if party:
+            party_bucket_col = f"{party}_{bucket}"
+            party_total_col = f"{party}_Total"
+            party_bucket = safe_int(row.get(party_bucket_col))
+            party_total = safe_int(row.get(party_total_col))
+            metrics["party_bucket_votes"] = party_bucket
+            metrics["party_total_votes"] = party_total
+            metrics["party_share"] = party_bucket / party_total if party_total else None
+
+        chamber_bucket = safe_int(row.get(f"Total_{bucket}"))
+        chamber_total = safe_int(row.get("Total_Total"))
+        metrics["chamber_bucket_votes"] = chamber_bucket
+        metrics["chamber_total_votes"] = chamber_total
+        metrics["chamber_share"] = chamber_bucket / chamber_total if chamber_total else None
+        return pd.Series(metrics)
+
+    metrics_df = df.apply(calc_metrics, axis=1)
+    df = pd.concat([df, metrics_df], axis=1)
+
+    df["focus_party_label"] = df["Person Party"]
+    df["focus_party_bucket_votes"] = df["party_bucket_votes"]
+    df["focus_party_total_votes"] = df["party_total_votes"]
+    df["focus_party_share"] = df["party_share"]
+
+    focus_party_key = FOCUS_PARTY_LOOKUP.get(party_focus_option)
+    if filter_mode == "Votes Against Party" and focus_party_key:
+        focus_display_label = (
+            "Independent" if focus_party_key == "Other" else party_focus_option
+        )
+
+        def calc_focus_metrics(row: pd.Series):
+            bucket = row["Vote Bucket"]
+            bucket_votes = safe_int(row.get(f"{focus_party_key}_{bucket}"))
+            total_votes = safe_int(row.get(f"{focus_party_key}_Total"))
+            share = bucket_votes / total_votes if total_votes else None
+            return pd.Series(
+                {
+                    "focus_party_label": focus_display_label,
+                    "focus_party_bucket_votes": bucket_votes,
+                    "focus_party_total_votes": total_votes,
+                    "focus_party_share": share,
+                }
+            )
+
+        focus_metrics = df.apply(calc_focus_metrics, axis=1)
+        df[
+            [
+                "focus_party_label",
+                "focus_party_bucket_votes",
+                "focus_party_total_votes",
+                "focus_party_share",
+            ]
+        ] = focus_metrics
+
+    deciding_condition = None
+    if filter_mode == "Deciding Votes":
+        deciding_condition = _apply_deciding_vote_filter(df, max_vote_diff)
+
+    apply_party_filter = filter_mode in {"Votes Against Party", "Minority Votes"}
+    apply_chamber_filter = filter_mode == "Minority Votes"
+    threshold_ratio = (
+        minority_percent / 100.0 if (apply_party_filter or apply_chamber_filter) else None
+    )
+    min_votes = min_group_votes if (apply_party_filter or apply_chamber_filter) else 0
+
+    filters = []
+    if apply_party_filter:
+        party_condition = (
+            df["focus_party_share"].notna()
+            & (df["focus_party_total_votes"] >= min_votes)
+            & (df["focus_party_share"] <= threshold_ratio)
+        )
+        filters.append(party_condition)
+    if apply_chamber_filter:
+        chamber_condition = (
+            df["chamber_share"].notna()
+            & (df["chamber_total_votes"] >= min_votes)
+            & (df["chamber_share"] <= threshold_ratio)
+        )
+        filters.append(chamber_condition)
+    if filter_mode == "Deciding Votes" and deciding_condition is not None:
+        filters.append(deciding_condition)
+
+    pre_filter_count = len(df)
+
+    if filters:
+        mask = filters[0]
+        for condition in filters[1:]:
+            mask &= condition
+        filtered_df = df[mask].copy()
+    else:
+        filtered_df = df.copy()
+
+    dedupe_keys = [col for col in ["Roll Call ID", "Person"] if col in filtered_df.columns]
+    if dedupe_keys:
+        filtered_df = filtered_df.drop_duplicates(subset=dedupe_keys).reset_index(drop=True)
+
+    if filtered_df.empty:
+        if filter_mode == "Skipped Votes":
+            raise ValueError("No skipped votes found for the selected criteria.")
+        if filter_mode == "Votes Against Party":
+            raise ValueError(
+                "No votes found where the legislator sided with the specified minority."
+            )
+        if filter_mode == "Minority Votes":
+            raise ValueError(
+                "No votes found where the legislator and chamber were both in the minority."
+            )
+        if filter_mode == "Deciding Votes":
+            raise ValueError(
+                "No votes found within the specified deciding vote margin."
+            )
+        if filter_mode == "Search By Term":
+            raise ValueError(
+                "No vote records found matching the provided search term."
+            )
+        raise ValueError("No vote records found for the selected criteria.")
+
+    return filtered_df, pre_filter_count
+
+
 def main() -> None:
     st.set_page_config(page_title="LegiScan JSON Vote Explorer", layout="wide")
     st.title("LegiScan JSON Vote Explorer (JSON Beta)")
@@ -186,7 +397,89 @@ def main() -> None:
         )
     st.caption(f"Archive selection: {state_display}")
 
-    selected_legislator = st.selectbox("Legislator", legislator_names)
+    selected_legislator = st.sidebar.selectbox(
+        "Legislator",
+        legislator_names,
+        index=0,
+        key="json_legislator_select",
+    )
+
+    filter_mode = st.sidebar.selectbox(
+        "Vote type",
+        options=FILTER_OPTIONS,
+        index=0,
+        key="json_filter_mode",
+        help="Choose a predefined view of the legislator's voting record.",
+    )
+    search_term = st.sidebar.text_input(
+        "Search term (bill description)",
+        value="",
+        key="json_search_term",
+    )
+
+    party_focus_option = "Legislator's Party"
+    minority_percent = 20
+    min_group_votes = 0
+    max_vote_diff = 5
+
+    if filter_mode == "Votes Against Party":
+        party_focus_option = st.sidebar.selectbox(
+            "Party voting against",
+            options=list(FOCUS_PARTY_LOOKUP.keys()),
+            index=0,
+            key="json_party_focus",
+            help="Choose which party's vote breakdown to compare against.",
+        )
+        minority_percent = st.sidebar.slider(
+            "Minority threshold (%)",
+            min_value=0,
+            max_value=100,
+            value=20,
+            key="json_votes_against_threshold",
+            help="Keep votes where the selected party supported the legislator at or below this percentage.",
+        )
+        min_group_votes = st.sidebar.slider(
+            "Minimum votes in group",
+            min_value=0,
+            max_value=200,
+            value=5,
+            key="json_votes_against_min_votes",
+            help="Ignore records where the compared party cast fewer total votes than this threshold.",
+        )
+        st.sidebar.caption("Shows votes where the legislator sided with a minority of the chosen party.")
+    elif filter_mode == "Minority Votes":
+        minority_percent = st.sidebar.slider(
+            "Minority threshold (%)",
+            min_value=0,
+            max_value=100,
+            value=20,
+            key="json_minority_threshold",
+            help="Keep votes where the legislator's party supported their position at or below this percentage.",
+        )
+        min_group_votes = st.sidebar.slider(
+            "Minimum votes in group",
+            min_value=0,
+            max_value=200,
+            value=5,
+            key="json_minority_min_votes",
+            help="Ignore records where the compared group cast fewer total votes than this threshold.",
+        )
+        st.sidebar.caption("Shows votes where the legislator and chamber were both in the minority.")
+    elif filter_mode == "Deciding Votes":
+        max_vote_diff = st.sidebar.slider(
+            "Maximum votes difference",
+            min_value=1,
+            max_value=50,
+            value=5,
+            key="json_deciding_max_diff",
+            help="Limit to votes where the margin between Yeas and Nays is within this amount.",
+        )
+        st.sidebar.caption("Shows votes where the legislator's side prevailed by the specified margin or less.")
+    elif filter_mode == "Search By Term":
+        st.sidebar.caption("Shows votes where the bill description matches the search term.")
+    elif filter_mode == "Skipped Votes":
+        st.sidebar.caption("Shows votes where the legislator did not cast a Yea or Nay.")
+
     generate_summary = st.button("Generate summary", type="primary")
 
     if generate_summary:
@@ -217,8 +510,50 @@ def main() -> None:
     summary_df = cached["df"]
     legislator = cached["legislator"]
 
-    st.success(f"Compiled {len(summary_df)} votes for {legislator}.")
+    year_options = sorted(
+        int(year)
+        for year in summary_df["Year"].dropna().unique().tolist()
+        if pd.notna(year)
+    )
+    st.session_state["json_year_options"] = year_options
+    stored_years = st.session_state.get("json_year_selection", [])
+    stored_years = [year for year in stored_years if year in year_options]
+    if not stored_years and year_options:
+        stored_years = year_options
+    year_selection = st.sidebar.multiselect(
+        "Year",
+        options=year_options,
+        default=stored_years,
+        key="json_year_selection_widget",
+        help="Restrict votes to selected calendar years.",
+        disabled=not year_options,
+    )
+    st.session_state["json_year_selection"] = year_selection
 
+    try:
+        filtered_df, total_count = apply_filters_json(
+            summary_df,
+            filter_mode=filter_mode,
+            search_term=search_term,
+            year_selection=year_selection,
+            party_focus_option=party_focus_option,
+            minority_percent=minority_percent,
+            min_group_votes=min_group_votes,
+            max_vote_diff=max_vote_diff,
+        )
+    except ValueError as exc:
+        st.warning(str(exc))
+        st.stop()
+
+    filtered_count = len(filtered_df)
+    st.success(
+        f"Compiled {total_count} votes for {legislator}. "
+        f"Showing {filtered_count} after filters."
+    )
+
+    display_df = filtered_df.copy()
+    if "Date_dt" in display_df.columns:
+        display_df["Date"] = display_df["Date_dt"].dt.date
     display_columns = [
         "Date",
         "Session",
@@ -229,12 +564,21 @@ def main() -> None:
         "Vote Bucket",
         "Result",
     ]
-    st.dataframe(summary_df[display_columns], use_container_width=True, height=400)
+    st.dataframe(display_df[display_columns], use_container_width=True, height=400)
 
+    export_df = filtered_df.copy()
+    if "Date_dt" in export_df.columns:
+        export_df = export_df.drop(columns=["Date_dt"])
+    excel_rows = (
+        export_df.reindex(columns=WORKBOOK_HEADERS)
+        .fillna("")
+        .values
+        .tolist()
+    )
     excel_buffer = io.BytesIO()
-    write_workbook(rows, legislator, excel_buffer)
+    write_workbook(excel_rows, legislator, excel_buffer)
     st.download_button(
-        label="Download Excel workbook",
+        label="Download filtered Excel sheet",
         data=excel_buffer.getvalue(),
         file_name=f"{legislator.replace(' ', '_')}_JSON_Votes.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
