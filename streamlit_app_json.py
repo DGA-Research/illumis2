@@ -112,41 +112,33 @@ def _prepare_dataframe(rows: List[List]) -> pd.DataFrame:
     return df
 
 
-def _render_state_filter() -> Tuple[str, Optional[str]]:
+def _render_state_filter() -> Tuple[List[str], List[str]]:
     st.sidebar.header("Dataset Selection")
-    state_label = st.sidebar.selectbox(
-        "State",
-        options=[ALL_STATES_LABEL] + [name for name, _ in STATE_CHOICES],
-        index=0,
-        help="Filter JSON archives by their two-letter prefix.",
+    state_labels = st.sidebar.multiselect(
+        "State(s)",
+        options=[name for name, _ in STATE_CHOICES],
+        default=[],
+        help="Choose one or more states to load their JSON archives.",
     )
-    return state_label, STATE_NAME_TO_CODE.get(state_label)
+    state_codes = [STATE_NAME_TO_CODE[label] for label in state_labels]
+    return state_labels, state_codes
 
 
-def _render_archive_picker(state_code: Optional[str]) -> List[str]:
+def _collect_archives_for_states(state_codes: List[str]) -> List[str]:
     available_archives = sorted(JSON_DATA_DIR.glob("*.zip"))
     if not available_archives:
         st.error(f"No JSON ZIP archives found in {JSON_DATA_DIR}.")
         st.stop()
 
-    if state_code:
-        filtered = [path.name for path in available_archives if path.name.upper().startswith(f"{state_code}_")]
-    else:
-        filtered = [path.name for path in available_archives]
-
-    if state_code and not filtered:
-        readable_state = STATE_CODE_TO_NAME.get(state_code, state_code)
-        st.warning(f"No JSON archives found for {readable_state}.")
+    if not state_codes:
         return []
 
-    widget_key = f"json_archive_select::{state_code or 'ALL'}"
-    return st.sidebar.multiselect(
-        "JSON archives",
-        options=filtered,
-        default=filtered,
-        key=widget_key,
-        help="Archives are loaded from the local 'JSON DATA' folder.",
-    )
+    selected: List[str] = []
+    for path in available_archives:
+        code = path.name[:2].upper()
+        if code in state_codes:
+            selected.append(path.name)
+    return selected
 
 
 def main() -> None:
@@ -154,10 +146,15 @@ def main() -> None:
     st.title("LegiScan JSON Vote Explorer (JSON Beta)")
     st.caption("Load LegiScan JSON archives by state, pick a legislator, and download their vote history.")
 
-    state_label, state_code = _render_state_filter()
-    selected_archive_names = _render_archive_picker(state_code)
+    state_labels, state_codes = _render_state_filter()
+    if not state_codes:
+        st.info("Select at least one state to continue.")
+        st.stop()
+
+    selected_archive_names = _collect_archives_for_states(state_codes)
     if not selected_archive_names:
-        st.info("Select at least one JSON archive (or choose a different state) to continue.")
+        readable_states = ", ".join(state_labels)
+        st.warning(f"No JSON archives found for: {readable_states}.")
         st.stop()
 
     archives_snapshot = tuple(sorted(selected_archive_names))
@@ -179,8 +176,8 @@ def main() -> None:
         st.warning("No legislators found in the selected archives.")
         st.stop()
 
-    if state_code:
-        state_display = STATE_CODE_TO_NAME.get(state_code, state_code)
+    if state_labels:
+        state_display = ", ".join(state_labels)
     else:
         state_display = (
             STATE_CODE_TO_NAME.get(dataset_state, dataset_state)
