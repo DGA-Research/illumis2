@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
 
 from generate_kristin_robbins_votes import WORKBOOK_HEADERS, write_workbook
 from json_legiscan_loader import (
@@ -85,6 +86,13 @@ FILTER_OPTIONS = [
     "Skipped Votes",
     "Search By Term",
 ]
+WORKBOOK_VIEWS = [
+    "All Votes",
+    "Votes Against Party",
+    "Minority Votes",
+    "Deciding Votes",
+    "Skipped Votes",
+]
 
 
 def _resolve_archives(selected_names: List[str]) -> List[Path]:
@@ -153,6 +161,43 @@ def _collect_archives_for_states(state_codes: List[str]) -> List[str]:
         if code in state_codes:
             selected.append(path.name)
     return selected
+
+
+def _sanitize_sheet_title(title: str, used_titles: set[str]) -> str:
+    cleaned = "".join(ch if ch not in '[]:*?/\\' else "_" for ch in title).strip() or "Sheet"
+    cleaned = cleaned[:31]
+    base = cleaned
+    counter = 1
+    while cleaned in used_titles:
+        suffix = f"_{counter}"
+        if len(base) + len(suffix) > 31:
+            cleaned = base[: 31 - len(suffix)] + suffix
+        else:
+            cleaned = base + suffix
+        counter += 1
+    used_titles.add(cleaned)
+    return cleaned
+
+
+def write_multi_sheet_workbook(
+    sheet_specs: List[Tuple[str, List[str], List[List]]],
+    output: io.BytesIO,
+) -> None:
+    wb = Workbook()
+    used_titles: set[str] = set()
+    first_sheet = True
+    for sheet_name, headers, rows in sheet_specs:
+        title = _sanitize_sheet_title(sheet_name, used_titles)
+        if first_sheet:
+            ws = wb.active
+            ws.title = title
+            first_sheet = False
+        else:
+            ws = wb.create_sheet(title=title)
+        ws.append(headers)
+        for row in rows:
+            ws.append(row)
+    wb.save(output)
 
 
 def safe_int(value: object) -> int:
@@ -480,7 +525,11 @@ def main() -> None:
     elif filter_mode == "Skipped Votes":
         st.sidebar.caption("Shows votes where the legislator did not cast a Yea or Nay.")
 
-    generate_summary = st.button("Generate summary", type="primary")
+    control_cols = st.columns(2)
+    with control_cols[0]:
+        generate_summary = st.button("Generate summary", type="primary")
+    with control_cols[1]:
+        generate_workbook_clicked = st.button("Generate all views workbook")
 
     if generate_summary:
         with st.spinner(f"Compiling votes for {selected_legislator}..."):
@@ -564,7 +613,7 @@ def main() -> None:
         "Vote Bucket",
         "Result",
     ]
-    st.dataframe(display_df[display_columns], use_container_width=True, height=400)
+    st.dataframe(display_df[display_columns], width="stretch", height=400)
 
     export_df = filtered_df.copy()
     if "Date_dt" in export_df.columns:
@@ -583,6 +632,79 @@ def main() -> None:
         file_name=f"{legislator.replace(' ', '_')}_JSON_Votes.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+    if generate_workbook_clicked:
+        workbook_views: List[Tuple[str, List[str], List[List]]] = []
+        empty_views: List[str] = []
+        stored_party_focus = st.session_state.get("json_party_focus", party_focus_option)
+        stored_votes_against_threshold = st.session_state.get("json_votes_against_threshold", 20)
+        stored_votes_against_min_votes = st.session_state.get("json_votes_against_min_votes", 5)
+        stored_minority_threshold = st.session_state.get("json_minority_threshold", 20)
+        stored_minority_min_votes = st.session_state.get("json_minority_min_votes", 5)
+        stored_deciding_max_diff = st.session_state.get("json_deciding_max_diff", 5)
+
+        base_params = {
+            "search_term": "",
+            "year_selection": year_selection or None,
+            "party_focus_option": "Legislator's Party",
+            "minority_percent": 20,
+            "min_group_votes": 0,
+            "max_vote_diff": 5,
+        }
+
+        for view_name in WORKBOOK_VIEWS:
+            params = base_params.copy()
+            if view_name == "Votes Against Party":
+                params.update(
+                    {
+                        "party_focus_option": stored_party_focus,
+                        "minority_percent": stored_votes_against_threshold,
+                        "min_group_votes": stored_votes_against_min_votes,
+                    }
+                )
+            elif view_name == "Minority Votes":
+                params.update(
+                    {
+                        "minority_percent": stored_minority_threshold,
+                        "min_group_votes": stored_minority_min_votes,
+                    }
+                )
+            elif view_name == "Deciding Votes":
+                params.update({"max_vote_diff": stored_deciding_max_diff})
+            try:
+                sheet_df, _ = apply_filters_json(
+                    summary_df,
+                    filter_mode=view_name,
+                    **params,
+                )
+            except ValueError:
+                empty_views.append(view_name)
+                continue
+            export_sheet = sheet_df.copy()
+            export_sheet = export_sheet.drop(columns=["Date_dt"], errors="ignore")
+            sheet_rows = (
+                export_sheet.reindex(columns=WORKBOOK_HEADERS)
+                .fillna("")
+                .values
+                .tolist()
+            )
+            workbook_views.append((view_name, WORKBOOK_HEADERS, sheet_rows))
+
+        if not workbook_views:
+            st.warning("No data available for the selected workbook views.")
+        else:
+            workbook_buffer = io.BytesIO()
+            write_multi_sheet_workbook(workbook_views, workbook_buffer)
+            workbook_buffer.seek(0)
+            st.download_button(
+                label="Download vote summary workbook",
+                data=workbook_buffer.getvalue(),
+                file_name=f"{legislator.replace(' ', '_')}_JSON_full_workbook.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="json_full_workbook_download",
+            )
+            if empty_views:
+                st.info("No data available for: " + ", ".join(empty_views))
 
 
 if __name__ == "__main__":
