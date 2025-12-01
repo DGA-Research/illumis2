@@ -7,6 +7,11 @@ from typing import Dict, List, Optional, Set, Tuple
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
+from docx import Document
+from docx.shared import Inches, Pt
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.opc.constants import RELATIONSHIP_TYPE
 
 from generate_kristin_robbins_votes import WORKBOOK_HEADERS, write_workbook
 from json_legiscan_loader import (
@@ -416,6 +421,147 @@ def _create_sponsor_only_rows(
             }
         )
     return rows
+
+
+def _add_hyperlink(paragraph, url: str, text: str) -> None:
+    if not url:
+        paragraph.add_run(text)
+        return
+    part = paragraph.part
+    r_id = part.relate_to(url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), r_id)
+
+    new_run = OxmlElement("w:r")
+    r_pr = OxmlElement("w:rPr")
+    r_style = OxmlElement("w:rStyle")
+    r_style.set(qn("w:val"), "Hyperlink")
+    r_pr.append(r_style)
+    underline = OxmlElement("w:u")
+    underline.set(qn("w:val"), "single")
+    r_pr.append(underline)
+    new_run.append(r_pr)
+
+    text_elem = OxmlElement("w:t")
+    text_elem.text = text
+    new_run.append(text_elem)
+
+    hyperlink.append(new_run)
+    paragraph._p.append(hyperlink)
+
+
+def _format_docx_date(date_value: str) -> str:
+    text = (date_value or "").strip()
+    if not text:
+        return text
+    date_formats = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y")
+    for fmt in date_formats:
+        try:
+            parsed = dt.datetime.strptime(text, fmt)
+            return f"{parsed.month}/{parsed.day}/{str(parsed.year)[-2:]}"
+        except ValueError:
+            continue
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+        return f"{parsed.month}/{parsed.day}/{str(parsed.year)[-2:]}"
+    except ValueError:
+        return text
+
+
+def _resolve_vote_phrases(vote_bucket: str) -> Tuple[str, str]:
+    bucket = (vote_bucket or "").strip().lower()
+    if bucket == "for":
+        return "VOTED FOR", "voted for"
+    if bucket == "against":
+        return "VOTED AGAINST", "voted against"
+    if bucket == "absent":
+        return "WAS ABSENT FOR", "was absent for"
+    return "DID NOT VOTE ON", "did not vote on"
+
+
+def _build_json_bullet_summary_doc(
+    rows: pd.DataFrame,
+    legislator_name: str,
+    filter_label: str,
+    state_label: str,
+) -> io.BytesIO:
+    doc = Document()
+    for section in doc.sections:
+        section.top_margin = Inches(0.5)
+        section.bottom_margin = Inches(0.5)
+        section.left_margin = Inches(0.5)
+        section.right_margin = Inches(0.5)
+
+    normal_style = doc.styles["Normal"]
+    normal_style.font.name = "Arial"
+    normal_style.font.size = Pt(10)
+
+    doc.add_heading(f"{legislator_name} - {filter_label}", level=1)
+
+    if rows.empty:
+        doc.add_paragraph("No records available for this selection.")
+    else:
+        working_rows = rows.copy()
+        if "Date_dt" not in working_rows.columns or working_rows["Date_dt"].isna().any():
+            working_rows["Date_dt"] = pd.to_datetime(
+                working_rows.get("Date"), errors="coerce"
+            )
+        for _, row in working_rows.iterrows():
+            vote_dt = row.get("Date_dt")
+            if pd.isna(vote_dt):
+                display_date = (row.get("Date") or "").strip()
+            else:
+                display_date = vote_dt.strftime("%B %d, %Y")
+
+            vote_bucket = row.get("Vote Bucket", "")
+            vote_upper, vote_lower = _resolve_vote_phrases(vote_bucket)
+
+            bill_number = (row.get("Bill Number") or "").strip() or "Unknown bill"
+            bill_title = (row.get("Bill Title") or "").strip()
+            bill_description = (row.get("Bill Description") or bill_title or "").strip()
+            if bill_description:
+                bill_description = bill_description.rstrip(".")
+            chamber = (row.get("Chamber") or "").strip() or "Chamber"
+            last_action = (row.get("Last Action") or row.get("Status Description") or "").strip()
+            sponsorship = (row.get("Sponsorship Status") or "").strip()
+            result_value = row.get("Result")
+            result_text = "Passed" if safe_int(result_value) == 1 else "Did not pass"
+
+            paragraph = doc.add_paragraph()
+            paragraph.paragraph_format.space_after = Pt(12)
+            paragraph.paragraph_format.space_before = Pt(0)
+            first_sentence = (
+                f"{display_date or 'Date unknown'}: {legislator_name} "
+                f"{vote_upper.title()} {bill_number}"
+            )
+            if bill_title:
+                first_sentence += f" - {bill_title}"
+            if sponsorship:
+                first_sentence += f" ({sponsorship})"
+            first_sentence += "."
+            paragraph.add_run(first_sentence + " ").bold = True
+
+            if bill_description:
+                paragraph.add_run(f"{legislator_name} {vote_lower} {bill_number}: \"{bill_description}.\" ")
+
+            if last_action:
+                paragraph.add_run(f"Latest action: {last_action}. ")
+            paragraph.add_run(f"Outcome: {result_text}. ")
+
+            paragraph.add_run("[")
+            paragraph.add_run(f"{state_label or 'State'} {chamber}, {bill_number}, ")
+            date_bracket = display_date or "Date unknown"
+            url = (row.get("URL") or "").strip()
+            if url:
+                _add_hyperlink(paragraph, url, date_bracket)
+            else:
+                paragraph.add_run(date_bracket)
+            paragraph.add_run("]")
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
 def safe_int(value: object) -> int:
     try:
         return int(value)
@@ -897,6 +1043,20 @@ def main() -> None:
         file_name=f"{legislator.replace(' ', '_')}_JSON_Votes.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+    if not filtered_df.empty:
+        bullet_buffer = _build_json_bullet_summary_doc(
+            filtered_df,
+            legislator,
+            filter_mode,
+            state_display,
+        )
+        st.download_button(
+            label="Download bullet summary",
+            data=bullet_buffer.getvalue(),
+            file_name=f"{legislator.replace(' ', '_')}_{filter_mode.replace('/', '_').replace(' ', '_')}_summary.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            key="json_bullet_summary_download",
+        )
 
     if generate_workbook_clicked:
         workbook_views: List[Tuple[str, List[str], List[List]]] = []
