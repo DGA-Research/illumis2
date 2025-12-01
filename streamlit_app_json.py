@@ -1,7 +1,6 @@
 import io
-from contextlib import ExitStack
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -9,6 +8,7 @@ import streamlit as st
 from generate_kristin_robbins_votes import WORKBOOK_HEADERS, write_workbook
 from json_legiscan_loader import (
     collect_legislator_names_json,
+    determine_json_state,
     extract_archives,
     gather_json_session_dirs,
 )
@@ -16,6 +16,61 @@ from json_vote_builder import collect_vote_rows_from_json
 
 JSON_DATA_DIR = Path(__file__).resolve().parent / "JSON DATA"
 SESSION_CACHE_KEY = "json_vote_summary"
+ALL_STATES_LABEL = "All States"
+STATE_CHOICES = [
+    ("Alabama", "AL"),
+    ("Alaska", "AK"),
+    ("Arizona", "AZ"),
+    ("Arkansas", "AR"),
+    ("California", "CA"),
+    ("Colorado", "CO"),
+    ("Connecticut", "CT"),
+    ("Delaware", "DE"),
+    ("Florida", "FL"),
+    ("Georgia", "GA"),
+    ("Hawaii", "HI"),
+    ("Idaho", "ID"),
+    ("Illinois", "IL"),
+    ("Indiana", "IN"),
+    ("Iowa", "IA"),
+    ("Kansas", "KS"),
+    ("Kentucky", "KY"),
+    ("Louisiana", "LA"),
+    ("Maine", "ME"),
+    ("Maryland", "MD"),
+    ("Massachusetts", "MA"),
+    ("Michigan", "MI"),
+    ("Minnesota", "MN"),
+    ("Mississippi", "MS"),
+    ("Missouri", "MO"),
+    ("Montana", "MT"),
+    ("Nebraska", "NE"),
+    ("Nevada", "NV"),
+    ("New Hampshire", "NH"),
+    ("New Jersey", "NJ"),
+    ("New Mexico", "NM"),
+    ("New York", "NY"),
+    ("North Carolina", "NC"),
+    ("North Dakota", "ND"),
+    ("Ohio", "OH"),
+    ("Oklahoma", "OK"),
+    ("Oregon", "OR"),
+    ("Pennsylvania", "PA"),
+    ("Rhode Island", "RI"),
+    ("South Carolina", "SC"),
+    ("South Dakota", "SD"),
+    ("Tennessee", "TN"),
+    ("Texas", "TX"),
+    ("Utah", "UT"),
+    ("Vermont", "VT"),
+    ("Virginia", "VA"),
+    ("Washington", "WA"),
+    ("West Virginia", "WV"),
+    ("Wisconsin", "WI"),
+    ("Wyoming", "WY"),
+]
+STATE_NAME_TO_CODE = {name: code for name, code in STATE_CHOICES}
+STATE_CODE_TO_NAME = {code: name for name, code in STATE_CHOICES}
 
 
 def _resolve_archives(selected_names: List[str]) -> List[Path]:
@@ -26,12 +81,14 @@ def _resolve_archives(selected_names: List[str]) -> List[Path]:
     return [lookup[name] for name in selected_names]
 
 
-def _load_legislator_names(selected_paths: List[Path]) -> List[str]:
+def _load_legislator_names(selected_paths: List[Path]) -> Tuple[List[str], Optional[str]]:
     extracted = extract_archives(selected_paths)
     try:
         base_dirs = [item.base_path for item in extracted]
         session_dirs = gather_json_session_dirs(base_dirs)
-        return collect_legislator_names_json(session_dirs)
+        dataset_state = determine_json_state(session_dirs)
+        names = collect_legislator_names_json(session_dirs)
+        return names, dataset_state
     finally:
         for item in extracted:
             item.cleanup()
@@ -55,16 +112,39 @@ def _prepare_dataframe(rows: List[List]) -> pd.DataFrame:
     return df
 
 
-def _render_archive_picker():
+def _render_state_filter() -> Tuple[str, Optional[str]]:
+    st.sidebar.header("Dataset Selection")
+    state_label = st.sidebar.selectbox(
+        "State",
+        options=[ALL_STATES_LABEL] + [name for name, _ in STATE_CHOICES],
+        index=0,
+        help="Filter JSON archives by their two-letter prefix.",
+    )
+    return state_label, STATE_NAME_TO_CODE.get(state_label)
+
+
+def _render_archive_picker(state_code: Optional[str]) -> List[str]:
     available_archives = sorted(JSON_DATA_DIR.glob("*.zip"))
     if not available_archives:
         st.error(f"No JSON ZIP archives found in {JSON_DATA_DIR}.")
         st.stop()
-    default_selection = [available_archives[0].name]
-    return st.multiselect(
+
+    if state_code:
+        filtered = [path.name for path in available_archives if path.name.upper().startswith(f"{state_code}_")]
+    else:
+        filtered = [path.name for path in available_archives]
+
+    if state_code and not filtered:
+        readable_state = STATE_CODE_TO_NAME.get(state_code, state_code)
+        st.warning(f"No JSON archives found for {readable_state}.")
+        return []
+
+    widget_key = f"json_archive_select::{state_code or 'ALL'}"
+    return st.sidebar.multiselect(
         "JSON archives",
-        options=[path.name for path in available_archives],
-        default=default_selection,
+        options=filtered,
+        default=filtered,
+        key=widget_key,
         help="Archives are loaded from the local 'JSON DATA' folder.",
     )
 
@@ -72,12 +152,15 @@ def _render_archive_picker():
 def main() -> None:
     st.set_page_config(page_title="LegiScan JSON Vote Explorer", layout="wide")
     st.title("LegiScan JSON Vote Explorer (JSON Beta)")
-    st.caption("Load LegiScan JSON archives, pick a legislator, and download their vote history.")
+    st.caption("Load LegiScan JSON archives by state, pick a legislator, and download their vote history.")
 
-    selected_archive_names = _render_archive_picker()
+    state_label, state_code = _render_state_filter()
+    selected_archive_names = _render_archive_picker(state_code)
     if not selected_archive_names:
-        st.info("Select at least one JSON archive to continue.")
+        st.info("Select at least one JSON archive (or choose a different state) to continue.")
         st.stop()
+
+    archives_snapshot = tuple(sorted(selected_archive_names))
 
     try:
         selected_paths = _resolve_archives(selected_archive_names)
@@ -87,7 +170,7 @@ def main() -> None:
 
     with st.spinner("Discovering legislators..."):
         try:
-            legislator_names = _load_legislator_names(selected_paths)
+            legislator_names, dataset_state = _load_legislator_names(selected_paths)
         except Exception as exc:
             st.error(f"Failed to read archives: {exc}")
             st.stop()
@@ -95,6 +178,16 @@ def main() -> None:
     if not legislator_names:
         st.warning("No legislators found in the selected archives.")
         st.stop()
+
+    if state_code:
+        state_display = STATE_CODE_TO_NAME.get(state_code, state_code)
+    else:
+        state_display = (
+            STATE_CODE_TO_NAME.get(dataset_state, dataset_state)
+            if dataset_state
+            else ALL_STATES_LABEL
+        )
+    st.caption(f"Archive selection: {state_display}")
 
     selected_legislator = st.selectbox("Legislator", legislator_names)
     generate_summary = st.button("Generate summary", type="primary")
@@ -104,16 +197,21 @@ def main() -> None:
             try:
                 rows = _build_vote_rows(selected_paths, selected_legislator)
             except Exception as exc:
-                st.error(str(exc))
+                st.error(f"Failed to build vote summary: {exc}")
                 st.stop()
         summary_df = _prepare_dataframe(rows)
         st.session_state[SESSION_CACHE_KEY] = {
             "rows": rows,
             "df": summary_df,
             "legislator": selected_legislator,
+            "archives": archives_snapshot,
         }
 
     cached = st.session_state.get(SESSION_CACHE_KEY)
+    if cached:
+        if cached.get("archives") != archives_snapshot or cached.get("legislator") not in legislator_names:
+            cached = None
+
     if not cached:
         st.info("Click **Generate summary** to build the vote dataset.")
         st.stop()
