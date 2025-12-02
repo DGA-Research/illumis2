@@ -405,6 +405,18 @@ def _format_roll_details_json(vote_entry: Optional[dict]) -> str:
     return f"{desc}{suffix}" if desc else suffix.strip()
 
 
+def _normalize_chamber_label(value: Optional[str]) -> str:
+    token = (value or "").strip()
+    if not token:
+        return "Chamber"
+    upper = token.upper()
+    if upper in {"H", "HOUSE", "LOWER"}:
+        return "House"
+    if upper in {"S", "SENATE", "UPPER"}:
+        return "Senate"
+    return token
+
+
 def _latest_history_entry_json(history: Optional[List[dict]]) -> Tuple[str, str]:
     if not history:
         return "", ""
@@ -721,7 +733,7 @@ def _build_json_bullet_summary_doc(
             bill_description = (row.get("Bill Description") or bill_title or "").strip()
             if bill_description:
                 bill_description = bill_description.rstrip(".")
-            chamber = (row.get("Chamber") or "").strip() or "Chamber"
+            chamber = _normalize_chamber_label(row.get("Chamber"))
             last_action = (row.get("Last Action") or row.get("Status Description") or "").strip()
             sponsorship = (row.get("Sponsorship Status") or "").strip()
             result_value = row.get("Result")
@@ -751,7 +763,7 @@ def _build_json_bullet_summary_doc(
             if bill_description:
                 paragraph.add_run(f"{legislator_name} {vote_lower} {bill_number}: \"{bill_description}.\" ")
 
-            paragraph.add_run(f"Outcome: {outcome_sentence} ")
+            paragraph.add_run(outcome_sentence + " ")
 
             if last_action:
                 paragraph.add_run(f"Latest action: {last_action}. ")
@@ -801,7 +813,7 @@ def _format_outcome_sentence(
     vote_summary_text: Optional[str],
 ) -> str:
     vote_date = display_date or "Date unknown"
-    chamber_label = chamber or "Chamber"
+    chamber_label = _normalize_chamber_label(chamber)
     normalized_bill = bill_number or "the bill"
     action = "pass" if safe_int(result_value) == 1 else "reject"
     sentence = f"On {vote_date} the {chamber_label} voted to {action} {normalized_bill}"
