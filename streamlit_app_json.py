@@ -1346,7 +1346,9 @@ def apply_filters_json(
 
 
 def _normalize_bill_marker(value: Optional[str]) -> str:
-    return (value or "").strip().upper()
+    if value is None:
+        return ""
+    return str(value).strip().upper()
 
 
 def _row_overlap_tokens(row: pd.Series) -> Set[Tuple]:
