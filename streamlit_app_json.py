@@ -33,7 +33,7 @@ from json_legiscan_loader import (
     extract_archives,
     gather_json_session_dirs,
 )
-from json_vote_builder import STATUS_LABELS, collect_vote_rows_from_json
+from json_vote_builder import STATUS_LABELS, collect_vote_rows_from_json, extract_crossfile_fields
 
 
 def _settings_value(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -493,10 +493,13 @@ def _build_json_sponsor_metadata(bill: dict, status: str) -> Dict[str, object]:
         elif body_token == "S":
             chamber_value = "Senate"
     excel_date = roll_date or status_date or last_action_date
+    crossfile_id, crossfile_number = extract_crossfile_fields(bill)
     return {
         "session_id": session_label,
         "bill_number": bill_number,
         "bill_id": bill_id,
+        "crossfile_bill_id": crossfile_id,
+        "crossfile_bill_number": crossfile_number,
         "bill_title": title,
         "bill_description": description,
         "bill_motion": bill_motion,
@@ -643,6 +646,8 @@ def _create_sponsor_only_rows(
                 "Session": meta.get("session_id", ""),
                 "Bill Number": meta.get("bill_number", ""),
                 "Bill ID": meta.get("bill_id") or sponsor_bill_id or "",
+                "Cross-file Bill ID": meta.get("crossfile_bill_id", ""),
+                "Cross-file Bill Number": meta.get("crossfile_bill_number", ""),
                 "Bill Motion": meta.get("bill_motion", "") or meta.get("bill_title", ""),
                 "URL": meta.get("bill_url", ""),
                 "Bill Title": meta.get("bill_title", ""),
