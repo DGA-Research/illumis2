@@ -271,6 +271,21 @@ def _resolve_archives(selected_names: List[str]) -> List[Path]:
     return [lookup[name] for name in selected_names]
 
 
+@st.cache_data(show_spinner=False)
+def load_legislators_for_archives(archive_names: Tuple[str, ...]) -> Tuple[List[str], Optional[str]]:
+    selected_paths = [Path(name) for name in archive_names]
+    extracted = extract_archives(selected_paths)
+    try:
+        base_dirs = [item.base_path for item in extracted]
+        session_dirs = gather_json_session_dirs(base_dirs)
+        dataset_state = determine_json_state(session_dirs)
+        names = collect_legislator_names_json(session_dirs)
+        return names, dataset_state
+    finally:
+        for item in extracted:
+            item.cleanup()
+
+
 def _load_legislator_names(selected_paths: List[Path]) -> Tuple[List[str], Optional[str]]:
     extracted = extract_archives(selected_paths)
     try:
@@ -994,12 +1009,10 @@ def main() -> None:
         st.error(str(exc))
         st.stop()
 
+    paths_snapshot = tuple(str(path) for path in selected_paths)
     with st.spinner("Discovering legislators..."):
-        try:
-            legislator_names, dataset_state = _load_legislator_names(selected_paths)
-        except Exception as exc:
-            st.error(f"Failed to read archives: {exc}")
-            st.stop()
+        legislator_names, dataset_state = load_legislators_for_archives(paths_snapshot)
+
 
     if not legislator_names:
         st.warning("No legislators found in the selected archives.")
