@@ -1345,18 +1345,38 @@ def apply_filters_json(
     return filtered_df, pre_filter_count
 
 
-def _roll_call_id_set(df: pd.DataFrame) -> Set[int]:
-    if "Roll Call ID" not in df.columns:
-        return set()
-    series = pd.to_numeric(df["Roll Call ID"], errors="coerce").dropna()
-    return {int(value) for value in series}
+def _normalize_bill_marker(value: Optional[str]) -> str:
+    return (value or "").strip().upper()
+
+
+def _row_overlap_tokens(row: pd.Series) -> Set[Tuple]:
+    tokens: Set[Tuple] = set()
+    session_label = _normalize_bill_marker(row.get("Session"))
+    roll_call_id = safe_int(row.get("Roll Call ID"))
+    if roll_call_id:
+        tokens.add(("roll_call", roll_call_id))
+    bill_id = _normalize_bill_marker(row.get("Bill ID"))
+    if session_label and bill_id:
+        tokens.add(("bill_id", session_label, bill_id))
+    bill_number = _normalize_bill_marker(row.get("Bill Number"))
+    if session_label and bill_number:
+        tokens.add(("bill_number", session_label, bill_number))
+    crossfile_id = _normalize_bill_marker(row.get("Cross-file Bill ID"))
+    if session_label and crossfile_id:
+        tokens.add(("crossfile_id", session_label, crossfile_id))
+        tokens.add(("bill_id", session_label, crossfile_id))
+    crossfile_number = _normalize_bill_marker(row.get("Cross-file Bill Number"))
+    if session_label and crossfile_number:
+        tokens.add(("crossfile_number", session_label, crossfile_number))
+        tokens.add(("bill_number", session_label, crossfile_number))
+    return tokens
 
 
 def _apply_filters_for_package(
     legislator_name: str,
     package: Dict[str, object],
     common_filter_kwargs: Dict[str, object],
-) -> Tuple[pd.DataFrame, int]:
+) -> Tuple[pd.DataFrame, int, List[Set[Tuple]], Set[Tuple]]:
     df = package.get("df")
     if df is None:
         raise ValueError(f"No vote dataset available for {legislator_name}.")
@@ -1364,7 +1384,14 @@ def _apply_filters_for_package(
     params["sponsor_metadata"] = package.get("sponsor_metadata")
     params["selected_legislator"] = legislator_name
     params["legislator_party_label"] = package.get("legislator_party_label", "")
-    return apply_filters_json(df, **params)
+    filtered_df, total_count = apply_filters_json(df, **params)
+    row_tokens: List[Set[Tuple]] = []
+    combined_tokens: Set[Tuple] = set()
+    for _, row in filtered_df.iterrows():
+        tokens = _row_overlap_tokens(row)
+        row_tokens.append(tokens)
+        combined_tokens.update(tokens)
+    return filtered_df, total_count, row_tokens, combined_tokens
 
 
 def _filter_with_legislator_overlap(
@@ -1376,31 +1403,45 @@ def _filter_with_legislator_overlap(
     primary_package = multi_legislator_data.get(primary_name)
     if primary_package is None:
         raise ValueError("Primary legislator dataset is unavailable. Regenerate the summary.")
-    filtered_df, total_count = _apply_filters_for_package(
+    (
+        primary_df,
+        total_count,
+        primary_row_tokens,
+        primary_token_set,
+    ) = _apply_filters_for_package(
         primary_name,
         primary_package,
         common_filter_kwargs,
     )
     if not comparison_legislators:
-        return filtered_df, total_count
-    overlap_ids = _roll_call_id_set(filtered_df)
-    if not overlap_ids:
-        raise ValueError("No roll-call votes found for the primary legislator with the current filters.")
+        return primary_df, total_count
+    overlap_tokens = set(primary_token_set)
+    if not overlap_tokens:
+        raise ValueError(
+            "No qualifying roll-call or cross-file identifiers found for the primary legislator."
+        )
     for comp_name in comparison_legislators:
         package = multi_legislator_data.get(comp_name)
         if package is None:
             raise ValueError(f"No cached dataset available for {comp_name}. Regenerate the summary.")
-        compare_df, _ = _apply_filters_for_package(comp_name, package, common_filter_kwargs)
-        overlap_ids &= _roll_call_id_set(compare_df)
-        if not overlap_ids:
+        _, _, _, comp_tokens = _apply_filters_for_package(comp_name, package, common_filter_kwargs)
+        overlap_tokens &= comp_tokens
+        if not overlap_tokens:
             break
-    if not overlap_ids:
+    if not overlap_tokens:
         raise ValueError(
             "No overlapping votes found for the selected legislators with the current filters."
         )
-    roll_ids = pd.to_numeric(filtered_df["Roll Call ID"], errors="coerce").astype("Int64")
-    filtered_df = filtered_df[roll_ids.isin(overlap_ids)].copy()
-    return filtered_df, total_count
+    mask = [
+        bool(tokens & overlap_tokens)
+        for tokens in primary_row_tokens
+    ]
+    filtered_subset = primary_df.loc[mask].copy()
+    if filtered_subset.empty:
+        raise ValueError(
+            "Overlapping votes were identified, but none remained after applying all filters."
+        )
+    return filtered_subset, total_count
 
 
 def main() -> None:
