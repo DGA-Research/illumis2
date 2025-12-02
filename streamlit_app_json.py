@@ -733,6 +733,7 @@ def _build_json_bullet_summary_doc(
     *,
     bill_vote_metadata: Optional[Dict[Tuple[str, str], List[Dict[str, object]]]] = None,
     full_summary_df: Optional[pd.DataFrame] = None,
+    include_amendments: bool = False,
 ) -> io.BytesIO:
     bill_vote_metadata = bill_vote_metadata or {}
     doc = Document()
@@ -796,12 +797,39 @@ def _build_json_bullet_summary_doc(
             sponsorship = (context_row.get("Sponsorship Status") or "").strip()
             last_action = (context_row.get("Last Action") or context_row.get("Status Description") or "").strip()
             roll_call_entries = bill_vote_metadata.get(key) or []
+            if not include_amendments:
+                roll_call_entries = [
+                    entry
+                    for entry in roll_call_entries
+                    if not _is_amendment_roll_call_entry(entry)
+                ]
+
+            bill_rows = bill_rows_map.get(key, [])
+            non_amendment_rows = bill_rows
+            if not include_amendments:
+                non_amendment_rows = [
+                    row for row in bill_rows if not _is_amendment_row(row)
+                ]
+
+            if not roll_call_entries and not non_amendment_rows:
+                continue
 
             paragraph = doc.add_paragraph()
             paragraph.paragraph_format.space_after = Pt(12)
             paragraph.paragraph_format.space_before = Pt(0)
 
-            example_row = bill_rows_map.get(key, [context_row])[0]
+            header_row = None
+            if roll_call_entries:
+                for entry in roll_call_entries:
+                    rcid = safe_int(entry.get("roll_call_id"))
+                    vote_row = vote_row_lookup.get(rcid)
+                    if vote_row is not None:
+                        header_row = vote_row
+                        break
+            if header_row is None:
+                header_row_source = non_amendment_rows or bill_rows or [context_row]
+                header_row = header_row_source[0]
+            example_row = header_row
             vote_dt = example_row.get("Date_dt")
             if pd.isna(vote_dt):
                 display_date = (example_row.get("Date") or "").strip()
@@ -826,7 +854,7 @@ def _build_json_bullet_summary_doc(
             summary_sentences: List[str] = []
 
             if not roll_call_entries:
-                for row in bill_rows_map.get(key, []):
+                for row in non_amendment_rows:
                     summary_sentences.append(
                         _build_roll_call_sentence_from_row(
                             row,
@@ -889,6 +917,18 @@ def _parse_roll_call_datetime(value: Optional[str]) -> dt.datetime:
         except ValueError:
             continue
     return dt.datetime.min
+
+
+def _is_amendment_roll_call_entry(entry: Optional[Dict[str, object]]) -> bool:
+    if not entry:
+        return False
+    desc = (entry.get("desc") or "").strip().lower()
+    return "amendment" in desc
+
+
+def _is_amendment_row(row: pd.Series) -> bool:
+    details = str(row.get("Roll Details") or "").lower()
+    return "amendment" in details
 
 
 def _build_roll_call_sentence_from_row(
@@ -1318,6 +1358,11 @@ def main() -> None:
         value="",
         key="json_search_term",
     )
+    bullet_amendments = st.sidebar.checkbox(
+        "Bullet bill amendments?",
+        value=False,
+        help="Include amendment roll-call votes when building the bullet summary.",
+    )
 
     party_focus_option = "Legislator's Party"
     minority_percent = 20
@@ -1521,6 +1566,7 @@ def main() -> None:
             state_display,
             bill_vote_metadata=bill_vote_metadata,
             full_summary_df=summary_df,
+            include_amendments=bullet_amendments,
         )
         st.download_button(
             label="Download bullet summary",
