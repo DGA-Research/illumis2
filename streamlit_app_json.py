@@ -797,39 +797,78 @@ def _build_json_bullet_summary_doc(
             last_action = (context_row.get("Last Action") or context_row.get("Status Description") or "").strip()
             roll_call_entries = bill_vote_metadata.get(key) or []
 
+            paragraph = doc.add_paragraph()
+            paragraph.paragraph_format.space_after = Pt(12)
+            paragraph.paragraph_format.space_before = Pt(0)
+
+            example_row = bill_rows_map.get(key, [context_row])[0]
+            vote_dt = example_row.get("Date_dt")
+            if pd.isna(vote_dt):
+                display_date = (example_row.get("Date") or "").strip()
+            else:
+                display_date = vote_dt.strftime("%B %d, %Y")
+            vote_bucket = example_row.get("Vote Bucket", "")
+            vote_upper, vote_lower = _resolve_vote_phrases(vote_bucket)
+            first_sentence = (
+                f"{display_date or 'Date unknown'}: {legislator_name} "
+                f"{vote_upper.title()} {bill_number}"
+            )
+            if bill_title:
+                first_sentence += f" - {bill_title}"
+            if sponsorship:
+                first_sentence += f" ({sponsorship})"
+            first_sentence += "."
+            paragraph.add_run(first_sentence + " ").bold = True
+
+            if bill_description:
+                paragraph.add_run(f"{legislator_name} {vote_lower} {bill_number}: \"{bill_description}.\" ")
+
+            summary_sentences: List[str] = []
+
             if not roll_call_entries:
                 for row in bill_rows_map.get(key, []):
-                    _render_legislator_vote_bullet(
-                        doc,
-                        row,
-                        legislator_name,
-                        bill_title,
-                        bill_description,
-                        sponsorship,
-                        last_action,
-                        state_label,
+                    summary_sentences.append(
+                        _build_roll_call_sentence_from_row(
+                            row,
+                            None,
+                            legislator_name,
+                            bill_number,
+                        )
                     )
-                continue
-
-            sorted_roll_calls = sorted(
-                roll_call_entries,
-                key=lambda entry: _parse_roll_call_datetime(entry.get("date")),
-            )
-            for entry in sorted_roll_calls:
-                roll_call_id = safe_int(entry.get("roll_call_id"))
-                vote_row = vote_row_lookup.get(roll_call_id)
-                _render_roll_call_bullet(
-                    doc,
-                    legislator_name,
-                    bill_number,
-                    bill_title,
-                    bill_description,
-                    sponsorship,
-                    last_action,
-                    entry,
-                    vote_row,
-                    state_label,
+            else:
+                sorted_roll_calls = sorted(
+                    roll_call_entries,
+                    key=lambda entry: _parse_roll_call_datetime(entry.get("date")),
                 )
+                for entry in sorted_roll_calls:
+                    roll_call_id = safe_int(entry.get("roll_call_id"))
+                    vote_row = vote_row_lookup.get(roll_call_id)
+                    summary_sentences.append(
+                        _build_roll_call_sentence_from_entry(
+                            entry,
+                            vote_row,
+                            legislator_name,
+                            bill_number,
+                        )
+                    )
+
+            summary_sentences = [s for s in summary_sentences if s]
+            if summary_sentences:
+                paragraph.add_run(" ".join(summary_sentences) + " ")
+
+            if last_action:
+                paragraph.add_run(f"Latest action: {last_action}. ")
+
+            paragraph.add_run("[")
+            bracket_chamber = _normalize_chamber_label(context_row.get("Chamber"))
+            paragraph.add_run(f"{state_label or 'State'} {bracket_chamber}, {bill_number}, ")
+            date_bracket = display_date or "Date unknown"
+            url = (context_row.get("URL") or "").strip()
+            if url:
+                _add_hyperlink(paragraph, url, date_bracket)
+            else:
+                paragraph.add_run(date_bracket)
+            paragraph.add_run("]")
 
     buffer = io.BytesIO()
     doc.save(buffer)
@@ -852,155 +891,66 @@ def _parse_roll_call_datetime(value: Optional[str]) -> dt.datetime:
     return dt.datetime.min
 
 
-def _render_legislator_vote_bullet(
-    doc: Document,
+def _build_roll_call_sentence_from_row(
     row: pd.Series,
+    entry: Optional[Dict[str, object]],
     legislator_name: str,
-    bill_title: str,
-    bill_description: str,
-    sponsorship: str,
-    last_action: str,
-    state_label: str,
-) -> None:
+    bill_number: str,
+) -> str:
     vote_dt = row.get("Date_dt")
     if pd.isna(vote_dt):
         display_date = (row.get("Date") or "").strip()
     else:
-        display_date = vote_dt.strftime("%B %d, %Y")
-
-    vote_bucket = row.get("Vote Bucket", "")
-    vote_upper, vote_lower = _resolve_vote_phrases(vote_bucket)
-
-    bill_number = (row.get("Bill Number") or "").strip() or "Unknown bill"
+        display_date = vote_dt.strftime("%m/%d/%Y")
     chamber = _normalize_chamber_label(row.get("Chamber"))
     result_value = row.get("Result")
     vote_summary_text = _format_vote_summary_counts(row)
     if not vote_summary_text:
-        vote_summary_text = _format_roll_call_counts_entry(
-            {
-                "yea": row.get("Total_For"),
-                "nay": row.get("Total_Against"),
-                "nv": row.get("Total_Not"),
-                "absent": row.get("Total_Absent"),
-            }
-        )
-    outcome_sentence = _format_outcome_sentence(
+        vote_summary_text = _format_roll_call_counts_entry(entry)
+    sentence = _format_roll_call_sentence(
         display_date,
         chamber,
-        bill_number,
         result_value,
         vote_summary_text,
+        bill_number,
+        entry,
     )
-
-    paragraph = doc.add_paragraph()
-    paragraph.paragraph_format.space_after = Pt(12)
-    paragraph.paragraph_format.space_before = Pt(0)
-    first_sentence = (
-        f"{display_date or 'Date unknown'}: {legislator_name} "
-        f"{vote_upper.title()} {bill_number}"
-    )
-    if bill_title:
-        first_sentence += f" - {bill_title}"
-    if sponsorship:
-        first_sentence += f" ({sponsorship})"
-    first_sentence += "."
-    paragraph.add_run(first_sentence + " ").bold = True
-
-    if bill_description:
-        paragraph.add_run(f"{legislator_name} {vote_lower} {bill_number}: \"{bill_description}.\" ")
-
-    paragraph.add_run(outcome_sentence + " ")
-
-    if last_action:
-        paragraph.add_run(f"Latest action: {last_action}. ")
-
-    paragraph.add_run("[")
-    paragraph.add_run(f"{state_label or 'State'} {chamber}, {bill_number}, ")
-    date_bracket = display_date or "Date unknown"
-    url = (row.get("URL") or "").strip()
-    if url:
-        _add_hyperlink(paragraph, url, date_bracket)
+    vote_bucket = row.get("Vote Bucket", "")
+    _, vote_lower = _resolve_vote_phrases(vote_bucket)
+    if vote_lower:
+        sentence += f", {legislator_name} {vote_lower}."
     else:
-        paragraph.add_run(date_bracket)
-    paragraph.add_run("]")
+        sentence += "."
+    return sentence
 
 
-def _render_roll_call_bullet(
-    doc: Document,
+def _build_roll_call_sentence_from_entry(
+    entry: Dict[str, object],
+    vote_row: Optional[pd.Series],
     legislator_name: str,
     bill_number: str,
-    bill_title: str,
-    bill_description: str,
-    sponsorship: str,
-    last_action: str,
-    roll_call_entry: Dict[str, object],
-    vote_row: Optional[pd.Series],
-    state_label: str,
-) -> None:
-    display_date = _format_json_date(roll_call_entry.get("date"))
+) -> str:
+    display_date = _format_json_date(entry.get("date"))
     chamber = _normalize_chamber_label(
-        roll_call_entry.get("chamber") or (vote_row.get("Chamber") if vote_row is not None else "")
+        entry.get("chamber") or (vote_row.get("Chamber") if vote_row is not None else "")
     )
-    paragraph = doc.add_paragraph()
-    paragraph.paragraph_format.space_after = Pt(12)
-    paragraph.paragraph_format.space_before = Pt(0)
-
-    if vote_row is not None:
-        vote_bucket = vote_row.get("Vote Bucket", "")
-        vote_upper, vote_lower = _resolve_vote_phrases(vote_bucket)
-        first_sentence = (
-            f"{display_date or 'Date unknown'}: {legislator_name} "
-            f"{vote_upper.title()} {bill_number}"
-        )
-        if bill_title:
-            first_sentence += f" - {bill_title}"
-        if sponsorship:
-            first_sentence += f" ({sponsorship})"
-        first_sentence += "."
-        paragraph.add_run(first_sentence + " ").bold = True
-        if bill_description:
-            paragraph.add_run(f"{legislator_name} {vote_lower} {bill_number}: \"{bill_description}.\" ")
-        vote_summary_text = _format_vote_summary_counts(vote_row) or _format_roll_call_counts_entry(roll_call_entry)
-        result_value = vote_row.get("Result")
-    else:
-        first_sentence = f"{display_date or 'Date unknown'}: {bill_number}"
-        if bill_title:
-            first_sentence += f" - {bill_title}"
-        first_sentence += "."
-        paragraph.add_run(first_sentence + " ").bold = True
-        if bill_description:
-            paragraph.add_run(f"{bill_number}: \"{bill_description}.\" ")
-        paragraph.add_run(
-            f"{legislator_name} did not cast a vote on this {chamber} roll call. "
-        )
-        vote_summary_text = _format_roll_call_counts_entry(roll_call_entry)
-        result_value = 1 if safe_int(roll_call_entry.get("passed")) == 1 else 0
-
-    outcome_sentence = _format_outcome_sentence(
+    result_value = 1 if safe_int(entry.get("passed")) == 1 else 0
+    vote_summary_text = _format_roll_call_counts_entry(entry)
+    sentence = _format_roll_call_sentence(
         display_date,
         chamber,
-        bill_number,
         result_value,
         vote_summary_text,
+        bill_number,
+        entry,
     )
-    paragraph.add_run(outcome_sentence + " ")
-
-    if last_action:
-        paragraph.add_run(f"Latest action: {last_action}. ")
-
-    paragraph.add_run("[")
-    paragraph.add_run(f"{state_label or 'State'} {chamber}, {bill_number}, ")
-    date_bracket = display_date or "Date unknown"
-    url = ""
     if vote_row is not None:
-        url = (vote_row.get("URL") or "").strip()
-    if not url:
-        url = (roll_call_entry.get("state_link") or roll_call_entry.get("url") or "").strip()
-    if url:
-        _add_hyperlink(paragraph, url, date_bracket)
+        vote_bucket = vote_row.get("Vote Bucket", "")
+        _, vote_lower = _resolve_vote_phrases(vote_bucket)
+        sentence += f", {legislator_name} {vote_lower}."
     else:
-        paragraph.add_run(date_bracket)
-    paragraph.add_run("]")
+        sentence += f" {legislator_name} did not cast a vote."
+    return sentence
 
 def safe_int(value: object) -> int:
     try:
@@ -1034,6 +984,31 @@ def _format_roll_call_counts_entry(entry: Optional[Dict[str, object]]) -> Option
     if total_sum == 0:
         return None
     return f"{total_for}-{total_against}-{total_not}-{total_absent}"
+
+
+def _format_roll_call_sentence(
+    display_date: Optional[str],
+    chamber: str,
+    result_value: object,
+    vote_summary_text: Optional[str],
+    bill_number: str,
+    roll_call_entry: Optional[Dict[str, object]],
+) -> str:
+    vote_date = display_date or "Date unknown"
+    chamber_label = chamber or "Chamber"
+    action = "pass" if safe_int(result_value) == 1 else "reject"
+    sentence = f"On {vote_date} the {chamber_label} voted to {action} {bill_number}"
+    if roll_call_entry:
+        desc = (roll_call_entry.get("desc") or "").strip()
+        if desc:
+            if "amendment" in desc.lower():
+                cleaned = desc.replace("Floor", "").strip()
+                sentence += f", {cleaned}"
+            else:
+                sentence += f", {desc}"
+    if vote_summary_text:
+        sentence += f", ({vote_summary_text})"
+    return sentence
 
 
 def _format_outcome_sentence(
