@@ -534,7 +534,10 @@ def _collect_sponsor_lookup_json(
                 bill_number = str(bill.get("bill_number") or "").strip()
                 if not session_label or not bill_number:
                     continue
-                key = (session_label, bill_number)
+                bill_id = str(bill.get("bill_id") or "").strip()
+                if not bill_id:
+                    continue
+                key = (session_label, bill_id)
                 for sponsor in bill.get("sponsors") or []:
                     name = (sponsor.get("name") or "").strip()
                     if name != target:
@@ -822,8 +825,8 @@ def apply_filters_json(
         sponsor_mask = sponsor_series.astype(str).str.strip() != ""
         df = df[sponsor_mask].copy()
         existing_keys: Set[Tuple[str, str]] = {
-            (str(session).strip(), str(bill_number).strip())
-            for session, bill_number in zip(df.get("Session", []), df.get("Bill Number", []))
+            (str(session).strip(), str(bill_id).strip())
+            for session, bill_id in zip(df.get("Session", []), df.get("Bill ID", []))
         }
         extra_rows: List[Dict[str, object]] = []
         if sponsor_metadata and selected_legislator:
@@ -1131,10 +1134,10 @@ def main() -> None:
             selected_legislator,
         )
         session_series = summary_df["Session"].astype(str)
-        bill_number_series = summary_df["Bill Number"].astype(str)
+        bill_id_series = summary_df["Bill ID"].astype(str)
         summary_df["Sponsorship Status"] = [
-            sponsor_lookup.get((session, bill_number), "")
-            for session, bill_number in zip(session_series, bill_number_series)
+            sponsor_lookup.get((session, bill_id), "")
+            for session, bill_id in zip(session_series, bill_id_series)
         ]
         st.session_state[SESSION_CACHE_KEY] = {
             "rows": rows,
