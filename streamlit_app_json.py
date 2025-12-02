@@ -35,23 +35,50 @@ from json_legiscan_loader import (
 )
 from json_vote_builder import STATUS_LABELS, collect_vote_rows_from_json
 
+
+def _settings_value(key: str, default: Optional[str] = None) -> Optional[str]:
+    secrets_obj = getattr(st, "secrets", None)
+    if secrets_obj and key in secrets_obj:
+        return secrets_obj[key]
+    return os.environ.get(key, default)
+
+
+def _service_account_info() -> Optional[Dict[str, object]]:
+    secrets_obj = getattr(st, "secrets", None)
+    if not secrets_obj or "gcp_service_account" not in secrets_obj:
+        return None
+    raw_info = secrets_obj["gcp_service_account"]
+    if hasattr(raw_info, "to_dict"):
+        return raw_info.to_dict()
+    if isinstance(raw_info, dict):
+        return raw_info.copy()
+    try:
+        return dict(raw_info)
+    except TypeError:
+        return None
+
+
 DEFAULT_JSON_DATA_DIR = Path(__file__).resolve().parent / "JSON DATA"
-GCS_BUCKET_NAME = os.environ.get("ILLUMIS_GCS_BUCKET")
-GCS_MANIFEST_BLOB = os.environ.get("ILLUMIS_GCS_MANIFEST", "manifest.json")
-ARCHIVE_CACHE_DIR = Path(
-    os.environ.get(
-        "ILLUMIS_ARCHIVE_CACHE_DIR",
-        Path(tempfile.gettempdir()) / "legiscan-json-archives",
-    )
+GCS_BUCKET_NAME = _settings_value("ILLUMIS_GCS_BUCKET")
+GCS_MANIFEST_BLOB = _settings_value("ILLUMIS_GCS_MANIFEST", "manifest.json")
+archive_cache_setting = _settings_value(
+    "ILLUMIS_ARCHIVE_CACHE_DIR",
+    str(Path(tempfile.gettempdir()) / "legiscan-json-archives"),
 )
+ARCHIVE_CACHE_DIR = Path(archive_cache_setting)
+ARCHIVE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+service_account = _service_account_info()
+if service_account:
+    creds_path = ARCHIVE_CACHE_DIR / "gcs-creds.json"
+    creds_path.write_text(json.dumps(service_account))
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
+    project_id = service_account.get("project_id")
+    if project_id:
+        os.environ.setdefault("GOOGLE_CLOUD_PROJECT", project_id)
+
 USE_REMOTE_ARCHIVES = bool(GCS_BUCKET_NAME)
 JSON_DATA_DIR = DEFAULT_JSON_DATA_DIR if not USE_REMOTE_ARCHIVES else ARCHIVE_CACHE_DIR
-
-service_account = dict(st.secrets["gcp_service_account"])
-creds_path = ARCHIVE_CACHE_DIR / "gcs-creds.json"
-creds_path.write_text(json.dumps(service_account))
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
-
 
 SESSION_CACHE_KEY = "json_vote_summary"
 ALL_STATES_LABEL = "All States"
