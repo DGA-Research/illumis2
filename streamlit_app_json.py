@@ -17,6 +17,11 @@ from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE
 
 try:
+    pd.set_option("future.no_silent_downcasting", True)
+except Exception:
+    pass
+
+try:
     from google.cloud import storage
 except ImportError:  # pragma: no cover - optional dependency for remote archives
     storage = None
@@ -41,15 +46,6 @@ ARCHIVE_CACHE_DIR = Path(
 )
 USE_REMOTE_ARCHIVES = bool(GCS_BUCKET_NAME)
 JSON_DATA_DIR = DEFAULT_JSON_DATA_DIR if not USE_REMOTE_ARCHIVES else ARCHIVE_CACHE_DIR
-
-if "gcp_service_account" in st.secrets and "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
-    ARCHIVE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    creds_path = ARCHIVE_CACHE_DIR / "gcp-creds.json"
-    creds_data = dict(st.secrets["gcp_service_account"])  # cast AttrDict → dict
-    creds_path.write_text(json.dumps(creds_data))
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
-
-
 SESSION_CACHE_KEY = "json_vote_summary"
 ALL_STATES_LABEL = "All States"
 
@@ -308,14 +304,16 @@ def _prepare_dataframe(rows: List[List]) -> pd.DataFrame:
 
 def _render_state_filter() -> Tuple[List[str], List[str]]:
     st.sidebar.header("Dataset Selection")
-    state_labels = st.sidebar.multiselect(
-        "State(s)",
+    selection = st.sidebar.selectbox(
+        "State",
         options=[name for name, _ in STATE_CHOICES],
-        default=[],
-        help="Choose one or more states to load their JSON archives.",
+        index=None,
+        placeholder="Select a state",
+        help="Choose a single state to load its JSON archives.",
     )
-    state_codes = [STATE_NAME_TO_CODE[label] for label in state_labels]
-    return state_labels, state_codes
+    if selection:
+        return [selection], [STATE_NAME_TO_CODE[selection]]
+    return [], []
 
 
 def _collect_archives_for_states(state_codes: List[str]) -> List[str]:
@@ -967,6 +965,15 @@ def main() -> None:
     st.set_page_config(page_title="LegiScan JSON Vote Explorer", layout="wide")
     st.title("LegiScan JSON Vote Explorer (JSON Beta)")
     st.caption("Load LegiScan JSON archives by state, pick a legislator, and download their vote history.")
+    with st.expander("How this workflow works", expanded=False):
+        st.markdown(
+            """
+            1. **Pick state archives** in the sidebar. When remote storage is configured, the app only downloads the ZIPs for the states you select.
+            2. **Choose a legislator and view** (All Votes, Votes Against Party, Sponsored Bills, etc.), then click **Generate summary** to cache the dataset.
+            3. **Filter & explore** using year, search term, minority/deciding controls, and review the live table to confirm the subset you need.
+            4. **Export results** with the download buttons: the current filtered sheet, a Word bullet summary, or the multi-view workbook.
+            """
+        )
 
     state_labels, state_codes = _render_state_filter()
     if not state_codes:
