@@ -556,15 +556,21 @@ def write_multi_sheet_workbook(
 def _collect_sponsor_lookup_json(
     archive_paths: List[Path],
     legislator_name: str,
-) -> Tuple[Dict[Tuple[str, str], str], Dict[Tuple[str, str], Dict[str, object]], str]:
+) -> Tuple[
+    Dict[Tuple[str, str], str],
+    Dict[Tuple[str, str], Dict[str, object]],
+    str,
+    Dict[Tuple[str, str], List[Dict[str, object]]],
+]:
     if not archive_paths:
-        return {}, {}, ""
+        return {}, {}, "", {}
     extracted = extract_archives(archive_paths)
     try:
         base_dirs = [item.base_path for item in extracted]
         session_dirs = gather_json_session_dirs(base_dirs)
         sponsor_lookup: Dict[Tuple[str, str], str] = {}
         sponsor_metadata: Dict[Tuple[str, str], Dict[str, object]] = {}
+        bill_vote_metadata: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
         legislator_party_label = ""
         target = legislator_name.strip()
         for session_dir in session_dirs:
@@ -584,6 +590,7 @@ def _collect_sponsor_lookup_json(
                 if not bill_id:
                     continue
                 key = (session_label, bill_id)
+                bill_vote_metadata[key] = bill.get("votes") or []
                 for sponsor in bill.get("sponsors") or []:
                     name = (sponsor.get("name") or "").strip()
                     if name != target:
@@ -603,7 +610,7 @@ def _collect_sponsor_lookup_json(
                         sponsor_metadata[key] = new_meta
                     elif meta.get("sponsorship_status") != "Primary Sponsor":
                         sponsor_metadata[key]["sponsorship_status"] = status
-        return sponsor_lookup, sponsor_metadata, legislator_party_label
+        return sponsor_lookup, sponsor_metadata, legislator_party_label, bill_vote_metadata
     finally:
         for item in extracted:
             item.cleanup()
@@ -723,7 +730,11 @@ def _build_json_bullet_summary_doc(
     legislator_name: str,
     filter_label: str,
     state_label: str,
+    *,
+    bill_vote_metadata: Optional[Dict[Tuple[str, str], List[Dict[str, object]]]] = None,
+    full_summary_df: Optional[pd.DataFrame] = None,
 ) -> io.BytesIO:
+    bill_vote_metadata = bill_vote_metadata or {}
     doc = Document()
     for section in doc.sections:
         section.top_margin = Inches(0.5)
@@ -745,79 +756,251 @@ def _build_json_bullet_summary_doc(
             working_rows["Date_dt"] = pd.to_datetime(
                 working_rows.get("Date"), errors="coerce"
             )
-        sort_columns = ["Date_dt"]
-        if "Roll Call ID" in working_rows.columns:
-            sort_columns.append("Roll Call ID")
         working_rows = working_rows.sort_values(
-            by=sort_columns,
+            by=["Date_dt", "Roll Call ID"] if "Roll Call ID" in working_rows.columns else ["Date_dt"],
             kind="mergesort",
             na_position="last",
         )
+
+        bill_rows_map: Dict[Tuple[str, str], List[pd.Series]] = {}
+        bill_context_row: Dict[Tuple[str, str], pd.Series] = {}
+        ordered_bill_keys: List[Tuple[str, str]] = []
         for _, row in working_rows.iterrows():
-            vote_dt = row.get("Date_dt")
-            if pd.isna(vote_dt):
-                display_date = (row.get("Date") or "").strip()
-            else:
-                display_date = vote_dt.strftime("%B %d, %Y")
+            session_label = str(row.get("Session") or "").strip()
+            bill_id = str(row.get("Bill ID") or "").strip()
+            if not session_label or not bill_id:
+                continue
+            key = (session_label, bill_id)
+            bill_rows_map.setdefault(key, []).append(row)
+            if key not in bill_context_row:
+                bill_context_row[key] = row
+                ordered_bill_keys.append(key)
 
-            vote_bucket = row.get("Vote Bucket", "")
-            vote_upper, vote_lower = _resolve_vote_phrases(vote_bucket)
+        vote_row_lookup: Dict[int, pd.Series] = {}
+        source_df = full_summary_df if full_summary_df is not None else working_rows
+        if source_df is not None:
+            for _, src_row in source_df.iterrows():
+                roll_call_identifier = safe_int(src_row.get("Roll Call ID"))
+                if roll_call_identifier:
+                    vote_row_lookup[roll_call_identifier] = src_row
 
-            bill_number = (row.get("Bill Number") or "").strip() or "Unknown bill"
-            bill_title = (row.get("Bill Title") or "").strip()
-            bill_description = (row.get("Bill Description") or bill_title or "").strip()
+        for key in ordered_bill_keys:
+            context_row = bill_context_row.get(key)
+            if context_row is None:
+                continue
+            bill_number = (context_row.get("Bill Number") or "").strip() or "Unknown bill"
+            bill_title = (context_row.get("Bill Title") or "").strip()
+            bill_description = (context_row.get("Bill Description") or bill_title or "").strip()
             if bill_description:
                 bill_description = bill_description.rstrip(".")
-            chamber = _normalize_chamber_label(row.get("Chamber"))
-            last_action = (row.get("Last Action") or row.get("Status Description") or "").strip()
-            sponsorship = (row.get("Sponsorship Status") or "").strip()
-            result_value = row.get("Result")
-            vote_summary_text = _format_vote_summary_counts(row)
-            outcome_sentence = _format_outcome_sentence(
-                display_date,
-                chamber,
-                bill_number,
-                result_value,
-                vote_summary_text,
+            sponsorship = (context_row.get("Sponsorship Status") or "").strip()
+            last_action = (context_row.get("Last Action") or context_row.get("Status Description") or "").strip()
+            roll_call_entries = bill_vote_metadata.get(key) or []
+
+            if not roll_call_entries:
+                for row in bill_rows_map.get(key, []):
+                    _render_legislator_vote_bullet(
+                        doc,
+                        row,
+                        legislator_name,
+                        bill_title,
+                        bill_description,
+                        sponsorship,
+                        last_action,
+                        state_label,
+                    )
+                continue
+
+            sorted_roll_calls = sorted(
+                roll_call_entries,
+                key=lambda entry: _parse_roll_call_datetime(entry.get("date")),
             )
-
-            paragraph = doc.add_paragraph()
-            paragraph.paragraph_format.space_after = Pt(12)
-            paragraph.paragraph_format.space_before = Pt(0)
-            first_sentence = (
-                f"{display_date or 'Date unknown'}: {legislator_name} "
-                f"{vote_upper.title()} {bill_number}"
-            )
-            if bill_title:
-                first_sentence += f" - {bill_title}"
-            if sponsorship:
-                first_sentence += f" ({sponsorship})"
-            first_sentence += "."
-            paragraph.add_run(first_sentence + " ").bold = True
-
-            if bill_description:
-                paragraph.add_run(f"{legislator_name} {vote_lower} {bill_number}: \"{bill_description}.\" ")
-
-            paragraph.add_run(outcome_sentence + " ")
-
-            if last_action:
-                paragraph.add_run(f"Latest action: {last_action}. ")
-
-            paragraph.add_run("[")
-            paragraph.add_run(f"{state_label or 'State'} {chamber}, {bill_number}, ")
-            date_bracket = display_date or "Date unknown"
-            url = (row.get("URL") or "").strip()
-            if url:
-                _add_hyperlink(paragraph, url, date_bracket)
-            else:
-                paragraph.add_run(date_bracket)
-            paragraph.add_run("]")
+            for entry in sorted_roll_calls:
+                roll_call_id = safe_int(entry.get("roll_call_id"))
+                vote_row = vote_row_lookup.get(roll_call_id)
+                _render_roll_call_bullet(
+                    doc,
+                    legislator_name,
+                    bill_number,
+                    bill_title,
+                    bill_description,
+                    sponsorship,
+                    last_action,
+                    entry,
+                    vote_row,
+                    state_label,
+                )
 
     buffer = io.BytesIO()
     doc.save(buffer)
     buffer.seek(0)
     return buffer
 
+
+def _parse_roll_call_datetime(value: Optional[str]) -> dt.datetime:
+    if not value:
+        return dt.datetime.min
+    try:
+        return dt.datetime.fromisoformat(value)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return dt.datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return dt.datetime.min
+
+
+def _render_legislator_vote_bullet(
+    doc: Document,
+    row: pd.Series,
+    legislator_name: str,
+    bill_title: str,
+    bill_description: str,
+    sponsorship: str,
+    last_action: str,
+    state_label: str,
+) -> None:
+    vote_dt = row.get("Date_dt")
+    if pd.isna(vote_dt):
+        display_date = (row.get("Date") or "").strip()
+    else:
+        display_date = vote_dt.strftime("%B %d, %Y")
+
+    vote_bucket = row.get("Vote Bucket", "")
+    vote_upper, vote_lower = _resolve_vote_phrases(vote_bucket)
+
+    bill_number = (row.get("Bill Number") or "").strip() or "Unknown bill"
+    chamber = _normalize_chamber_label(row.get("Chamber"))
+    result_value = row.get("Result")
+    vote_summary_text = _format_vote_summary_counts(row)
+    if not vote_summary_text:
+        vote_summary_text = _format_roll_call_counts_entry(
+            {
+                "yea": row.get("Total_For"),
+                "nay": row.get("Total_Against"),
+                "nv": row.get("Total_Not"),
+                "absent": row.get("Total_Absent"),
+            }
+        )
+    outcome_sentence = _format_outcome_sentence(
+        display_date,
+        chamber,
+        bill_number,
+        result_value,
+        vote_summary_text,
+    )
+
+    paragraph = doc.add_paragraph()
+    paragraph.paragraph_format.space_after = Pt(12)
+    paragraph.paragraph_format.space_before = Pt(0)
+    first_sentence = (
+        f"{display_date or 'Date unknown'}: {legislator_name} "
+        f"{vote_upper.title()} {bill_number}"
+    )
+    if bill_title:
+        first_sentence += f" - {bill_title}"
+    if sponsorship:
+        first_sentence += f" ({sponsorship})"
+    first_sentence += "."
+    paragraph.add_run(first_sentence + " ").bold = True
+
+    if bill_description:
+        paragraph.add_run(f"{legislator_name} {vote_lower} {bill_number}: \"{bill_description}.\" ")
+
+    paragraph.add_run(outcome_sentence + " ")
+
+    if last_action:
+        paragraph.add_run(f"Latest action: {last_action}. ")
+
+    paragraph.add_run("[")
+    paragraph.add_run(f"{state_label or 'State'} {chamber}, {bill_number}, ")
+    date_bracket = display_date or "Date unknown"
+    url = (row.get("URL") or "").strip()
+    if url:
+        _add_hyperlink(paragraph, url, date_bracket)
+    else:
+        paragraph.add_run(date_bracket)
+    paragraph.add_run("]")
+
+
+def _render_roll_call_bullet(
+    doc: Document,
+    legislator_name: str,
+    bill_number: str,
+    bill_title: str,
+    bill_description: str,
+    sponsorship: str,
+    last_action: str,
+    roll_call_entry: Dict[str, object],
+    vote_row: Optional[pd.Series],
+    state_label: str,
+) -> None:
+    display_date = _format_json_date(roll_call_entry.get("date"))
+    chamber = _normalize_chamber_label(
+        roll_call_entry.get("chamber") or (vote_row.get("Chamber") if vote_row is not None else "")
+    )
+    paragraph = doc.add_paragraph()
+    paragraph.paragraph_format.space_after = Pt(12)
+    paragraph.paragraph_format.space_before = Pt(0)
+
+    if vote_row is not None:
+        vote_bucket = vote_row.get("Vote Bucket", "")
+        vote_upper, vote_lower = _resolve_vote_phrases(vote_bucket)
+        first_sentence = (
+            f"{display_date or 'Date unknown'}: {legislator_name} "
+            f"{vote_upper.title()} {bill_number}"
+        )
+        if bill_title:
+            first_sentence += f" - {bill_title}"
+        if sponsorship:
+            first_sentence += f" ({sponsorship})"
+        first_sentence += "."
+        paragraph.add_run(first_sentence + " ").bold = True
+        if bill_description:
+            paragraph.add_run(f"{legislator_name} {vote_lower} {bill_number}: \"{bill_description}.\" ")
+        vote_summary_text = _format_vote_summary_counts(vote_row) or _format_roll_call_counts_entry(roll_call_entry)
+        result_value = vote_row.get("Result")
+    else:
+        first_sentence = f"{display_date or 'Date unknown'}: {bill_number}"
+        if bill_title:
+            first_sentence += f" - {bill_title}"
+        first_sentence += "."
+        paragraph.add_run(first_sentence + " ").bold = True
+        if bill_description:
+            paragraph.add_run(f"{bill_number}: \"{bill_description}.\" ")
+        paragraph.add_run(
+            f"{legislator_name} did not cast a vote on this {chamber} roll call. "
+        )
+        vote_summary_text = _format_roll_call_counts_entry(roll_call_entry)
+        result_value = 1 if safe_int(roll_call_entry.get("passed")) == 1 else 0
+
+    outcome_sentence = _format_outcome_sentence(
+        display_date,
+        chamber,
+        bill_number,
+        result_value,
+        vote_summary_text,
+    )
+    paragraph.add_run(outcome_sentence + " ")
+
+    if last_action:
+        paragraph.add_run(f"Latest action: {last_action}. ")
+
+    paragraph.add_run("[")
+    paragraph.add_run(f"{state_label or 'State'} {chamber}, {bill_number}, ")
+    date_bracket = display_date or "Date unknown"
+    url = ""
+    if vote_row is not None:
+        url = (vote_row.get("URL") or "").strip()
+    if not url:
+        url = (roll_call_entry.get("state_link") or roll_call_entry.get("url") or "").strip()
+    if url:
+        _add_hyperlink(paragraph, url, date_bracket)
+    else:
+        paragraph.add_run(date_bracket)
+    paragraph.add_run("]")
 
 def safe_int(value: object) -> int:
     try:
@@ -834,6 +1017,19 @@ def _format_vote_summary_counts(row: pd.Series) -> Optional[str]:
     total_against = safe_int(row.get("Total_Against"))
     total_not = safe_int(row.get("Total_Not"))
     total_absent = safe_int(row.get("Total_Absent"))
+    total_sum = total_for + total_against + total_not + total_absent
+    if total_sum == 0:
+        return None
+    return f"{total_for}-{total_against}-{total_not}-{total_absent}"
+
+
+def _format_roll_call_counts_entry(entry: Optional[Dict[str, object]]) -> Optional[str]:
+    if not entry:
+        return None
+    total_for = safe_int(entry.get("yea"))
+    total_against = safe_int(entry.get("nay"))
+    total_not = safe_int(entry.get("nv"))
+    total_absent = safe_int(entry.get("absent"))
     total_sum = total_for + total_against + total_not + total_absent
     if total_sum == 0:
         return None
@@ -1226,7 +1422,12 @@ def main() -> None:
                 st.error(f"Failed to build vote summary: {exc}")
                 st.stop()
         summary_df = _prepare_dataframe(rows)
-        sponsor_lookup, sponsor_metadata, legislator_party_label = _collect_sponsor_lookup_json(
+        (
+            sponsor_lookup,
+            sponsor_metadata,
+            legislator_party_label,
+            bill_vote_metadata,
+        ) = _collect_sponsor_lookup_json(
             selected_paths,
             selected_legislator,
         )
@@ -1243,6 +1444,7 @@ def main() -> None:
             "archives": archives_snapshot,
             "sponsor_metadata": sponsor_metadata,
             "legislator_party_label": legislator_party_label,
+            "bill_vote_metadata": bill_vote_metadata,
         }
 
     cached = st.session_state.get(SESSION_CACHE_KEY)
@@ -1259,6 +1461,7 @@ def main() -> None:
     legislator = cached["legislator"]
     sponsor_metadata = cached.get("sponsor_metadata", {})
     legislator_party_label = cached.get("legislator_party_label", "")
+    bill_vote_metadata = cached.get("bill_vote_metadata", {})
     if "Sponsorship Status" not in summary_df.columns:
         summary_df["Sponsorship Status"] = ""
 
@@ -1341,6 +1544,8 @@ def main() -> None:
             legislator,
             filter_mode,
             state_display,
+            bill_vote_metadata=bill_vote_metadata,
+            full_summary_df=summary_df,
         )
         st.download_button(
             label="Download bullet summary",
