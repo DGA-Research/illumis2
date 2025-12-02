@@ -685,6 +685,36 @@ def _create_sponsor_only_rows(
     return rows
 
 
+def _build_legislator_dataset(
+    selected_paths: List[Path],
+    legislator_name: str,
+) -> Dict[str, object]:
+    rows = _build_vote_rows(selected_paths, legislator_name)
+    summary_df = _prepare_dataframe(rows)
+    (
+        sponsor_lookup,
+        sponsor_metadata,
+        legislator_party_label,
+        bill_vote_metadata,
+    ) = _collect_sponsor_lookup_json(
+        selected_paths,
+        legislator_name,
+    )
+    session_series = summary_df["Session"].astype(str)
+    bill_id_series = summary_df["Bill ID"].astype(str)
+    summary_df["Sponsorship Status"] = [
+        sponsor_lookup.get((session, bill_id), "")
+        for session, bill_id in zip(session_series, bill_id_series)
+    ]
+    return {
+        "rows": rows,
+        "df": summary_df,
+        "sponsor_metadata": sponsor_metadata,
+        "legislator_party_label": legislator_party_label,
+        "bill_vote_metadata": bill_vote_metadata,
+    }
+
+
 def _add_hyperlink(paragraph, url: str, text: str) -> None:
     if not url:
         paragraph.add_run(text)
@@ -1315,6 +1345,64 @@ def apply_filters_json(
     return filtered_df, pre_filter_count
 
 
+def _roll_call_id_set(df: pd.DataFrame) -> Set[int]:
+    if "Roll Call ID" not in df.columns:
+        return set()
+    series = pd.to_numeric(df["Roll Call ID"], errors="coerce").dropna()
+    return {int(value) for value in series}
+
+
+def _apply_filters_for_package(
+    legislator_name: str,
+    package: Dict[str, object],
+    common_filter_kwargs: Dict[str, object],
+) -> Tuple[pd.DataFrame, int]:
+    df = package.get("df")
+    if df is None:
+        raise ValueError(f"No vote dataset available for {legislator_name}.")
+    params = dict(common_filter_kwargs)
+    params["sponsor_metadata"] = package.get("sponsor_metadata")
+    params["selected_legislator"] = legislator_name
+    params["legislator_party_label"] = package.get("legislator_party_label", "")
+    return apply_filters_json(df, **params)
+
+
+def _filter_with_legislator_overlap(
+    primary_name: str,
+    multi_legislator_data: Dict[str, Dict[str, object]],
+    comparison_legislators: List[str],
+    common_filter_kwargs: Dict[str, object],
+) -> Tuple[pd.DataFrame, int]:
+    primary_package = multi_legislator_data.get(primary_name)
+    if primary_package is None:
+        raise ValueError("Primary legislator dataset is unavailable. Regenerate the summary.")
+    filtered_df, total_count = _apply_filters_for_package(
+        primary_name,
+        primary_package,
+        common_filter_kwargs,
+    )
+    if not comparison_legislators:
+        return filtered_df, total_count
+    overlap_ids = _roll_call_id_set(filtered_df)
+    if not overlap_ids:
+        raise ValueError("No roll-call votes found for the primary legislator with the current filters.")
+    for comp_name in comparison_legislators:
+        package = multi_legislator_data.get(comp_name)
+        if package is None:
+            raise ValueError(f"No cached dataset available for {comp_name}. Regenerate the summary.")
+        compare_df, _ = _apply_filters_for_package(comp_name, package, common_filter_kwargs)
+        overlap_ids &= _roll_call_id_set(compare_df)
+        if not overlap_ids:
+            break
+    if not overlap_ids:
+        raise ValueError(
+            "No overlapping votes found for the selected legislators with the current filters."
+        )
+    roll_ids = pd.to_numeric(filtered_df["Roll Call ID"], errors="coerce").astype("Int64")
+    filtered_df = filtered_df[roll_ids.isin(overlap_ids)].copy()
+    return filtered_df, total_count
+
+
 def main() -> None:
     st.set_page_config(page_title="LegiScan JSON Vote Explorer", layout="wide")
     st.title("LegiScan JSON Vote Explorer (JSON Beta)")
@@ -1372,6 +1460,13 @@ def main() -> None:
         legislator_names,
         index=0,
         key="json_legislator_select",
+    )
+    comparison_options = [name for name in legislator_names if name != selected_legislator]
+    additional_legislators = st.sidebar.multiselect(
+        "Additional legislators (overlap)",
+        options=comparison_options,
+        key="json_additional_legislators",
+        help="Limit results to votes shared with these legislators (same roll call and filters).",
     )
 
     filter_mode = st.sidebar.selectbox(
@@ -1470,28 +1565,30 @@ def main() -> None:
     legislator_party_label = ""
 
     if generate_summary:
-        with st.spinner(f"Compiling votes for {selected_legislator}..."):
-            try:
-                rows = _build_vote_rows(selected_paths, selected_legislator)
-            except Exception as exc:
-                st.error(f"Failed to build vote summary: {exc}")
-                st.stop()
-        summary_df = _prepare_dataframe(rows)
-        (
-            sponsor_lookup,
-            sponsor_metadata,
-            legislator_party_label,
-            bill_vote_metadata,
-        ) = _collect_sponsor_lookup_json(
-            selected_paths,
-            selected_legislator,
-        )
-        session_series = summary_df["Session"].astype(str)
-        bill_id_series = summary_df["Bill ID"].astype(str)
-        summary_df["Sponsorship Status"] = [
-            sponsor_lookup.get((session, bill_id), "")
-            for session, bill_id in zip(session_series, bill_id_series)
+        targets = [selected_legislator] + [
+            name for name in additional_legislators if name != selected_legislator
         ]
+        seen_targets: Set[str] = set()
+        ordered_targets: List[str] = []
+        for name in targets:
+            if name and name not in seen_targets:
+                ordered_targets.append(name)
+                seen_targets.add(name)
+        multi_legislator_data: Dict[str, Dict[str, object]] = {}
+        for name in ordered_targets:
+            with st.spinner(f"Compiling votes for {name}..."):
+                try:
+                    package = _build_legislator_dataset(selected_paths, name)
+                except Exception as exc:
+                    st.error(f"Failed to build vote summary for {name}: {exc}")
+                    st.stop()
+            multi_legislator_data[name] = package
+        primary_package = multi_legislator_data[selected_legislator]
+        rows = primary_package["rows"]
+        summary_df = primary_package["df"]
+        sponsor_metadata = primary_package.get("sponsor_metadata", {})
+        legislator_party_label = primary_package.get("legislator_party_label", "")
+        bill_vote_metadata = primary_package.get("bill_vote_metadata", {})
         st.session_state[SESSION_CACHE_KEY] = {
             "rows": rows,
             "df": summary_df,
@@ -1500,23 +1597,52 @@ def main() -> None:
             "sponsor_metadata": sponsor_metadata,
             "legislator_party_label": legislator_party_label,
             "bill_vote_metadata": bill_vote_metadata,
+            "multi_legislator_data": multi_legislator_data,
+            "additional_legislators": additional_legislators,
         }
 
     cached = st.session_state.get(SESSION_CACHE_KEY)
     if cached:
         if cached.get("archives") != archives_snapshot or cached.get("legislator") not in legislator_names:
             cached = None
+        else:
+            cached_compare = set(cached.get("additional_legislators", []))
+            if cached_compare != set(additional_legislators):
+                cached = None
 
     if not cached:
         st.info("Click **Generate summary** to build the vote dataset.")
         st.stop()
 
-    rows = cached["rows"]
-    summary_df = cached["df"]
     legislator = cached["legislator"]
-    sponsor_metadata = cached.get("sponsor_metadata", {})
-    legislator_party_label = cached.get("legislator_party_label", "")
-    bill_vote_metadata = cached.get("bill_vote_metadata", {})
+    multi_legislator_data: Dict[str, Dict[str, object]] = cached.get("multi_legislator_data") or {}
+    if not multi_legislator_data:
+        multi_legislator_data = {
+            legislator: {
+                "rows": cached.get("rows", []),
+                "df": cached.get("df"),
+                "sponsor_metadata": cached.get("sponsor_metadata", {}),
+                "legislator_party_label": cached.get("legislator_party_label", ""),
+                "bill_vote_metadata": cached.get("bill_vote_metadata", {}),
+            }
+        }
+    primary_package = multi_legislator_data.get(legislator)
+    if primary_package is None:
+        primary_package = {
+            "rows": cached.get("rows", []),
+            "df": cached.get("df"),
+            "sponsor_metadata": cached.get("sponsor_metadata", {}),
+            "legislator_party_label": cached.get("legislator_party_label", ""),
+            "bill_vote_metadata": cached.get("bill_vote_metadata", {}),
+        }
+        multi_legislator_data[legislator] = primary_package
+        cached["multi_legislator_data"] = multi_legislator_data
+        st.session_state[SESSION_CACHE_KEY] = cached
+    rows = primary_package.get("rows", [])
+    summary_df = primary_package.get("df")
+    sponsor_metadata = primary_package.get("sponsor_metadata", {})
+    legislator_party_label = primary_package.get("legislator_party_label", "")
+    bill_vote_metadata = primary_package.get("bill_vote_metadata", {})
     if "Sponsorship Status" not in summary_df.columns:
         summary_df["Sponsorship Status"] = ""
 
@@ -1540,29 +1666,37 @@ def main() -> None:
     )
     st.session_state["json_year_selection"] = year_selection
 
+    comparison_legislators = [
+        name for name in additional_legislators if name in multi_legislator_data
+    ]
+    common_filter_kwargs = {
+        "filter_mode": filter_mode,
+        "search_term": search_term,
+        "bill_id_filters": bill_id_filters,
+        "year_selection": year_selection,
+        "party_focus_option": party_focus_option,
+        "minority_percent": minority_percent,
+        "min_group_votes": min_group_votes,
+        "max_vote_diff": max_vote_diff,
+    }
     try:
-        filtered_df, total_count = apply_filters_json(
-            summary_df,
-            filter_mode=filter_mode,
-            search_term=search_term,
-            bill_id_filters=bill_id_filters,
-            year_selection=year_selection,
-            party_focus_option=party_focus_option,
-            minority_percent=minority_percent,
-            min_group_votes=min_group_votes,
-            max_vote_diff=max_vote_diff,
-            sponsor_metadata=sponsor_metadata,
-            selected_legislator=legislator,
-            legislator_party_label=legislator_party_label,
+        filtered_df, total_count = _filter_with_legislator_overlap(
+            legislator,
+            multi_legislator_data,
+            comparison_legislators,
+            common_filter_kwargs,
         )
     except ValueError as exc:
         st.warning(str(exc))
         st.stop()
 
     filtered_count = len(filtered_df)
+    overlap_note = ""
+    if comparison_legislators:
+        overlap_note = f" (overlap across {1 + len(comparison_legislators)} legislators)"
     st.success(
         f"Compiled {total_count} votes for {legislator}. "
-        f"Showing {filtered_count} after filters."
+        f"Showing {filtered_count} after filters{overlap_note}."
     )
 
     display_df = filtered_df.copy()
@@ -1637,9 +1771,6 @@ def main() -> None:
             "minority_percent": 20,
             "min_group_votes": 0,
             "max_vote_diff": 5,
-            "sponsor_metadata": sponsor_metadata,
-            "selected_legislator": legislator,
-            "legislator_party_label": legislator_party_label,
         }
 
         for view_name in WORKBOOK_VIEWS:
@@ -1662,10 +1793,14 @@ def main() -> None:
             elif view_name == "Deciding Votes":
                 params.update({"max_vote_diff": stored_deciding_max_diff})
             try:
-                sheet_df, _ = apply_filters_json(
-                    summary_df,
-                    filter_mode=view_name,
-                    **params,
+                sheet_df, _ = _filter_with_legislator_overlap(
+                    legislator,
+                    multi_legislator_data,
+                    comparison_legislators,
+                    {
+                        "filter_mode": view_name,
+                        **params,
+                    },
                 )
             except ValueError:
                 empty_views.append(view_name)
