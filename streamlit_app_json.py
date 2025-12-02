@@ -451,6 +451,17 @@ def _normalize_chamber_label(value: Optional[str]) -> str:
     return token
 
 
+def _parse_bill_id_list(raw_text: str) -> List[str]:
+    if not raw_text:
+        return []
+    normalized: List[str] = []
+    for part in raw_text.replace("\r", "\n").replace(",", "\n").split("\n"):
+        value = part.strip()
+        if value:
+            normalized.append(value)
+    return normalized
+
+
 def _latest_history_entry_json(history: Optional[List[dict]]) -> Tuple[str, str]:
     if not history:
         return "", ""
@@ -1095,6 +1106,7 @@ def apply_filters_json(
     *,
     filter_mode: str,
     search_term: str = "",
+    bill_id_filters: Optional[List[str]] = None,
     year_selection: Optional[List[int]] = None,
     party_focus_option: str = "Legislator's Party",
     minority_percent: int = 20,
@@ -1114,6 +1126,17 @@ def apply_filters_json(
             search_term, case=False, na=False
         )
         df = df[description_mask].copy()
+
+    if bill_id_filters:
+        normalized_ids = {
+            str(bill_id).strip()
+            for bill_id in bill_id_filters
+            if str(bill_id).strip()
+        }
+        if normalized_ids:
+            df = df[df["Bill ID"].astype(str).str.strip().isin(normalized_ids)].copy()
+            if df.empty:
+                raise ValueError("No vote records found for the provided Bill IDs.")
 
     if df.empty:
         raise ValueError("No vote records found for the selected criteria.")
@@ -1363,6 +1386,13 @@ def main() -> None:
         value="",
         key="json_search_term",
     )
+    bill_id_filter_text = st.sidebar.text_area(
+        "Bill IDs (optional)",
+        value="",
+        key="json_bill_id_filter",
+        help="Comma or newline separated list of Bill IDs to include.",
+    )
+    bill_id_filters = _parse_bill_id_list(bill_id_filter_text)
     bullet_amendments = st.sidebar.checkbox(
         "Bullet bill amendments?",
         value=False,
@@ -1515,6 +1545,7 @@ def main() -> None:
             summary_df,
             filter_mode=filter_mode,
             search_term=search_term,
+            bill_id_filters=bill_id_filters,
             year_selection=year_selection,
             party_focus_option=party_focus_option,
             minority_percent=minority_percent,
@@ -1600,6 +1631,7 @@ def main() -> None:
 
         base_params = {
             "search_term": "",
+            "bill_id_filters": bill_id_filters,
             "year_selection": year_selection or None,
             "party_focus_option": "Legislator's Party",
             "minority_percent": 20,
