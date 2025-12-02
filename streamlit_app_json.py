@@ -621,6 +621,7 @@ def _create_sponsor_only_rows(
     for idx, (key, meta) in enumerate(sponsor_metadata.items()):
         if key in existing_keys:
             continue
+        session_label, sponsor_bill_id = key
         roll_call_value = meta.get("roll_call_id", "")
         try:
             normalized_roll_id = int(str(roll_call_value))
@@ -634,7 +635,7 @@ def _create_sponsor_only_rows(
                 "Chamber": meta.get("chamber", ""),
                 "Session": meta.get("session_id", ""),
                 "Bill Number": meta.get("bill_number", ""),
-                "Bill ID": meta.get("bill_id", ""),
+                "Bill ID": meta.get("bill_id") or sponsor_bill_id or "",
                 "Bill Motion": meta.get("bill_motion", "") or meta.get("bill_title", ""),
                 "URL": meta.get("bill_url", ""),
                 "Bill Title": meta.get("bill_title", ""),
