@@ -43,9 +43,12 @@ USE_REMOTE_ARCHIVES = bool(GCS_BUCKET_NAME)
 JSON_DATA_DIR = DEFAULT_JSON_DATA_DIR if not USE_REMOTE_ARCHIVES else ARCHIVE_CACHE_DIR
 
 if "gcp_service_account" in st.secrets and "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+    ARCHIVE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     creds_path = ARCHIVE_CACHE_DIR / "gcp-creds.json"
-    creds_path.write_text(json.dumps(st.secrets["gcp_service_account"]))
+    creds_data = dict(st.secrets["gcp_service_account"])  # cast AttrDict → dict
+    creds_path.write_text(json.dumps(creds_data))
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
+
 
 SESSION_CACHE_KEY = "json_vote_summary"
 ALL_STATES_LABEL = "All States"
