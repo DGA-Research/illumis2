@@ -47,8 +47,9 @@ ARCHIVE_CACHE_DIR = Path(
 USE_REMOTE_ARCHIVES = bool(GCS_BUCKET_NAME)
 JSON_DATA_DIR = DEFAULT_JSON_DATA_DIR if not USE_REMOTE_ARCHIVES else ARCHIVE_CACHE_DIR
 
+service_account = dict(st.secrets["gcp_service_account"])
 creds_path = ARCHIVE_CACHE_DIR / "gcs-creds.json"
-creds_path.write_text(json.dumps(st.secrets["gcp_service_account"]))
+creds_path.write_text(json.dumps(service_account))
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
 
 
