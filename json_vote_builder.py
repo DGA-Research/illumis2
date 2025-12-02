@@ -104,6 +104,24 @@ def _latest_history_entry(history: List[dict]) -> Tuple[str, str]:
     )
 
 
+def extract_crossfile_fields(bill: dict) -> Tuple[str, str]:
+    entries = bill.get("sasts") or []
+    if not isinstance(entries, list):
+        return "", ""
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = (entry.get("type") or "").strip().lower()
+        type_id = entry.get("type_id")
+        if entry_type == "crossfiled" or (isinstance(type_id, int) and type_id == 5):
+            crossfile_id = entry.get("sast_bill_id") or entry.get("bill_id") or ""
+            crossfile_number = entry.get("sast_bill_number") or entry.get("bill_number") or ""
+            crossfile_id = str(crossfile_id).strip() if crossfile_id is not None else ""
+            crossfile_number = str(crossfile_number).strip() if crossfile_number is not None else ""
+            return crossfile_id, crossfile_number
+    return "", ""
+
+
 def _build_row(
     roll_call: dict,
     vote_record: dict,
@@ -130,12 +148,15 @@ def _build_row(
     bill_title = bill.get("title") or ""
     bill_description = bill.get("description") or ""
     bill_motion = bill_description or bill_title or bill.get("bill_number") or ""
+    crossfile_id, crossfile_number = extract_crossfile_fields(bill)
 
     row_values: Dict[str, object] = {
         "Chamber": chamber,
         "Session": session_label,
         "Bill Number": bill.get("bill_number") or "",
         "Bill ID": bill_id or "",
+        "Cross-file Bill ID": crossfile_id,
+        "Cross-file Bill Number": crossfile_number,
         "Bill Motion": bill_motion,
         "URL": bill.get("state_link") or bill.get("url") or "",
         "Bill Title": bill_title,
