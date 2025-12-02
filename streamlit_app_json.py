@@ -1,6 +1,9 @@
 import io
 import json
+import os
+import tempfile
 import datetime as dt
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -13,6 +16,11 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE
 
+try:
+    from google.cloud import storage
+except ImportError:  # pragma: no cover - optional dependency for remote archives
+    storage = None
+
 from generate_kristin_robbins_votes import WORKBOOK_HEADERS, write_workbook
 from json_legiscan_loader import (
     collect_legislator_names_json,
@@ -22,9 +30,148 @@ from json_legiscan_loader import (
 )
 from json_vote_builder import STATUS_LABELS, collect_vote_rows_from_json
 
-JSON_DATA_DIR = Path(__file__).resolve().parent / "JSON DATA"
+DEFAULT_JSON_DATA_DIR = Path(__file__).resolve().parent / "JSON DATA"
+GCS_BUCKET_NAME = os.environ.get("ILLUMIS_GCS_BUCKET")
+GCS_MANIFEST_BLOB = os.environ.get("ILLUMIS_GCS_MANIFEST", "manifest.json")
+ARCHIVE_CACHE_DIR = Path(
+    os.environ.get(
+        "ILLUMIS_ARCHIVE_CACHE_DIR",
+        Path(tempfile.gettempdir()) / "legiscan-json-archives",
+    )
+)
+USE_REMOTE_ARCHIVES = bool(GCS_BUCKET_NAME)
+JSON_DATA_DIR = DEFAULT_JSON_DATA_DIR if not USE_REMOTE_ARCHIVES else ARCHIVE_CACHE_DIR
 SESSION_CACHE_KEY = "json_vote_summary"
 ALL_STATES_LABEL = "All States"
+
+
+@lru_cache(maxsize=1)
+def _storage_client():
+    if storage is None:
+        raise RuntimeError(
+            "google-cloud-storage is required when ILLUMIS_GCS_BUCKET is configured."
+        )
+    return storage.Client()
+
+
+def _parse_iso8601(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    text = text.replace("Z", "+00:00")
+    try:
+        return dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _normalize_manifest_entry(state_code: str, entry: object) -> Optional[Dict[str, object]]:
+    if isinstance(entry, str):
+        blob_path = entry
+        name = Path(entry).name
+        updated = None
+        size = None
+    elif isinstance(entry, dict):
+        blob_path = (
+            entry.get("blob_path")
+            or entry.get("blob")
+            or entry.get("path")
+            or entry.get("name")
+        )
+        name = entry.get("name") or (Path(blob_path).name if blob_path else None)
+        updated = entry.get("updated") or entry.get("last_modified")
+        size = entry.get("size")
+    else:
+        return None
+    if not blob_path or not name:
+        return None
+    return {
+        "state": state_code,
+        "name": name,
+        "blob_path": blob_path,
+        "updated": updated,
+        "size": size,
+    }
+
+
+def _build_manifest(payload: object) -> Dict[str, List[Dict[str, object]]]:
+    manifest: Dict[str, List[Dict[str, object]]] = {}
+    if isinstance(payload, dict):
+        items = payload.items()
+    elif isinstance(payload, list):
+        items = (
+            ((entry.get("state") or "").strip().upper(), [entry])
+            for entry in payload
+            if isinstance(entry, dict)
+        )
+    else:
+        raise ValueError(
+            "GCS manifest must be a JSON object keyed by state codes or a list of state entries."
+        )
+    for state_key, entries in items:
+        code = (state_key or "").strip().upper()
+        if not code:
+            continue
+        normalized_entries: List[Dict[str, object]] = []
+        if not isinstance(entries, list):
+            entries = [entries]
+        for entry in entries:
+            normalized = _normalize_manifest_entry(code, entry)
+            if normalized:
+                normalized_entries.append(normalized)
+        if normalized_entries:
+            manifest[code] = normalized_entries
+    return manifest
+
+
+@lru_cache(maxsize=1)
+def _cached_manifest() -> Dict[str, List[Dict[str, object]]]:
+    if not USE_REMOTE_ARCHIVES:
+        return {}
+    client = _storage_client()
+    bucket = client.bucket(GCS_BUCKET_NAME)
+    blob = bucket.blob(GCS_MANIFEST_BLOB)
+    payload = json.loads(blob.download_as_text())
+    return _build_manifest(payload)
+
+
+@lru_cache(maxsize=1)
+def _remote_archive_lookup() -> Dict[str, Dict[str, object]]:
+    lookup: Dict[str, Dict[str, object]] = {}
+    for entries in _cached_manifest().values():
+        for entry in entries:
+            lookup[entry["name"]] = entry
+    return lookup
+
+
+def _ensure_remote_archive(entry: Dict[str, object]) -> Path:
+    ARCHIVE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    local_path = ARCHIVE_CACHE_DIR / str(entry["name"])
+    updated = _parse_iso8601(entry.get("updated"))
+    if local_path.exists() and updated:
+        normalized_updated = (
+            updated if updated.tzinfo else updated.replace(tzinfo=dt.timezone.utc)
+        )
+        updated_ts = normalized_updated.timestamp()
+        if local_path.stat().st_mtime >= updated_ts:
+            return local_path
+    elif local_path.exists():
+        return local_path
+    client = _storage_client()
+    bucket = client.bucket(GCS_BUCKET_NAME)
+    blob = bucket.blob(str(entry["blob_path"]))
+    tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+    blob.download_to_filename(tmp_path)
+    tmp_path.replace(local_path)
+    if updated:
+        normalized_updated = (
+            updated if updated.tzinfo else updated.replace(tzinfo=dt.timezone.utc)
+        )
+        timestamp = normalized_updated.timestamp()
+        os.utime(local_path, (timestamp, timestamp))
+    return local_path
 STATE_CHOICES = [
     ("Alabama", "AL"),
     ("Alaska", "AK"),
@@ -105,7 +252,14 @@ WORKBOOK_VIEWS = [
 
 
 def _resolve_archives(selected_names: List[str]) -> List[Path]:
-    lookup = {path.name: path for path in JSON_DATA_DIR.glob("*.zip")}
+    if USE_REMOTE_ARCHIVES:
+        lookup = _remote_archive_lookup()
+        missing = [name for name in selected_names if name not in lookup]
+        if missing:
+            raise FileNotFoundError(f"Missing archive(s) in manifest: {', '.join(missing)}")
+        return [_ensure_remote_archive(lookup[name]) for name in selected_names]
+
+    lookup = {path.name: path for path in DEFAULT_JSON_DATA_DIR.glob("*.zip")}
     missing = [name for name in selected_names if name not in lookup]
     if missing:
         raise FileNotFoundError(f"Missing archive(s): {', '.join(missing)}")
@@ -156,13 +310,26 @@ def _render_state_filter() -> Tuple[List[str], List[str]]:
 
 
 def _collect_archives_for_states(state_codes: List[str]) -> List[str]:
-    available_archives = sorted(JSON_DATA_DIR.glob("*.zip"))
-    if not available_archives:
-        st.error(f"No JSON ZIP archives found in {JSON_DATA_DIR}.")
-        st.stop()
-
     if not state_codes:
         return []
+
+    if USE_REMOTE_ARCHIVES:
+        manifest = _cached_manifest()
+        if not manifest:
+            st.error(
+                "No JSON archives are listed in the configured GCS manifest. "
+                "Confirm ILLUMIS_GCS_BUCKET and ILLUMIS_GCS_MANIFEST are correct."
+            )
+            st.stop()
+        selected: List[str] = []
+        for code in state_codes:
+            selected.extend([entry["name"] for entry in manifest.get(code, [])])
+        return selected
+
+    available_archives = sorted(DEFAULT_JSON_DATA_DIR.glob("*.zip"))
+    if not available_archives:
+        st.error(f"No JSON ZIP archives found in {DEFAULT_JSON_DATA_DIR}.")
+        st.stop()
 
     selected: List[str] = []
     for path in available_archives:
