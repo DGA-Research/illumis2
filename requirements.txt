@@ -1,2 +1,5 @@
 openpyxl
 python-docx
+pandas
+streamlit
+google-cloud-storage
