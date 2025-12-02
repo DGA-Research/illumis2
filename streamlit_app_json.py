@@ -718,6 +718,7 @@ def _build_json_bullet_summary_doc(
             sponsorship = (row.get("Sponsorship Status") or "").strip()
             result_value = row.get("Result")
             result_text = "Passed" if safe_int(result_value) == 1 else "Did not pass"
+            vote_summary_text = _format_vote_summary_counts(row)
 
             paragraph = doc.add_paragraph()
             paragraph.paragraph_format.space_after = Pt(12)
@@ -738,7 +739,12 @@ def _build_json_bullet_summary_doc(
 
             if last_action:
                 paragraph.add_run(f"Latest action: {last_action}. ")
-            paragraph.add_run(f"Outcome: {result_text}. ")
+            if vote_summary_text:
+                paragraph.add_run(
+                    f"Outcome: {result_text} {chamber} ({vote_summary_text}). "
+                )
+            else:
+                paragraph.add_run(f"Outcome: {result_text}. ")
 
             paragraph.add_run("[")
             paragraph.add_run(f"{state_label or 'State'} {chamber}, {bill_number}, ")
@@ -754,11 +760,27 @@ def _build_json_bullet_summary_doc(
     doc.save(buffer)
     buffer.seek(0)
     return buffer
+
+
 def safe_int(value: object) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _format_vote_summary_counts(row: pd.Series) -> Optional[str]:
+    required_cols = {"Total_For", "Total_Against", "Total_Not", "Total_Absent"}
+    if not required_cols.issubset(row.index):
+        return None
+    total_for = safe_int(row.get("Total_For"))
+    total_against = safe_int(row.get("Total_Against"))
+    total_not = safe_int(row.get("Total_Not"))
+    total_absent = safe_int(row.get("Total_Absent"))
+    total_sum = total_for + total_against + total_not + total_absent
+    if total_sum == 0:
+        return None
+    return f"{total_for}-{total_against}-{total_not}-{total_absent}"
 
 
 def _apply_deciding_vote_filter(df: pd.DataFrame, max_vote_diff: int) -> pd.Series:
