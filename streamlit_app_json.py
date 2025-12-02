@@ -698,6 +698,14 @@ def _build_json_bullet_summary_doc(
             working_rows["Date_dt"] = pd.to_datetime(
                 working_rows.get("Date"), errors="coerce"
             )
+        sort_columns = ["Date_dt"]
+        if "Roll Call ID" in working_rows.columns:
+            sort_columns.append("Roll Call ID")
+        working_rows = working_rows.sort_values(
+            by=sort_columns,
+            kind="mergesort",
+            na_position="last",
+        )
         for _, row in working_rows.iterrows():
             vote_dt = row.get("Date_dt")
             if pd.isna(vote_dt):
@@ -717,8 +725,14 @@ def _build_json_bullet_summary_doc(
             last_action = (row.get("Last Action") or row.get("Status Description") or "").strip()
             sponsorship = (row.get("Sponsorship Status") or "").strip()
             result_value = row.get("Result")
-            result_text = "Passed" if safe_int(result_value) == 1 else "Did not pass"
             vote_summary_text = _format_vote_summary_counts(row)
+            outcome_sentence = _format_outcome_sentence(
+                display_date,
+                chamber,
+                bill_number,
+                result_value,
+                vote_summary_text,
+            )
 
             paragraph = doc.add_paragraph()
             paragraph.paragraph_format.space_after = Pt(12)
@@ -737,14 +751,10 @@ def _build_json_bullet_summary_doc(
             if bill_description:
                 paragraph.add_run(f"{legislator_name} {vote_lower} {bill_number}: \"{bill_description}.\" ")
 
+            paragraph.add_run(f"Outcome: {outcome_sentence} ")
+
             if last_action:
                 paragraph.add_run(f"Latest action: {last_action}. ")
-            if vote_summary_text:
-                paragraph.add_run(
-                    f"Outcome: {result_text} {chamber} ({vote_summary_text}). "
-                )
-            else:
-                paragraph.add_run(f"Outcome: {result_text}. ")
 
             paragraph.add_run("[")
             paragraph.add_run(f"{state_label or 'State'} {chamber}, {bill_number}, ")
@@ -781,6 +791,24 @@ def _format_vote_summary_counts(row: pd.Series) -> Optional[str]:
     if total_sum == 0:
         return None
     return f"{total_for}-{total_against}-{total_not}-{total_absent}"
+
+
+def _format_outcome_sentence(
+    display_date: str,
+    chamber: str,
+    bill_number: str,
+    result_value: object,
+    vote_summary_text: Optional[str],
+) -> str:
+    vote_date = display_date or "Date unknown"
+    chamber_label = chamber or "Chamber"
+    normalized_bill = bill_number or "the bill"
+    action = "pass" if safe_int(result_value) == 1 else "reject"
+    sentence = f"On {vote_date} the {chamber_label} voted to {action} {normalized_bill}"
+    if vote_summary_text:
+        sentence += f", ({vote_summary_text})"
+    sentence += "."
+    return sentence
 
 
 def _apply_deciding_vote_filter(df: pd.DataFrame, max_vote_diff: int) -> pd.Series:
