@@ -16,11 +16,6 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE
 
-if "gcp_service_account" in st.secrets and "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
-    creds_path = ARCHIVE_CACHE_DIR / "gcp-creds.json"
-    creds_path.write_text(json.dumps(st.secrets["gcp_service_account"]))
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
-
 try:
     from google.cloud import storage
 except ImportError:  # pragma: no cover - optional dependency for remote archives
@@ -46,6 +41,12 @@ ARCHIVE_CACHE_DIR = Path(
 )
 USE_REMOTE_ARCHIVES = bool(GCS_BUCKET_NAME)
 JSON_DATA_DIR = DEFAULT_JSON_DATA_DIR if not USE_REMOTE_ARCHIVES else ARCHIVE_CACHE_DIR
+
+if "gcp_service_account" in st.secrets and "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+    creds_path = ARCHIVE_CACHE_DIR / "gcp-creds.json"
+    creds_path.write_text(json.dumps(st.secrets["gcp_service_account"]))
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
+
 SESSION_CACHE_KEY = "json_vote_summary"
 ALL_STATES_LABEL = "All States"
 
