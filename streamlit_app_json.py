@@ -1113,11 +1113,7 @@ def main() -> None:
     elif filter_mode == "Sponsored/Cosponsored Bills":
         st.sidebar.caption("Shows votes on bills the legislator sponsored or co-sponsored.")
 
-    control_cols = st.columns(2)
-    with control_cols[0]:
-        generate_summary = st.button("Generate summary", type="primary")
-    with control_cols[1]:
-        generate_workbook_clicked = st.button("Generate all views workbook")
+    generate_summary = st.button("Generate summary", type="primary")
 
     sponsor_metadata: Dict[Tuple[str, str], Dict[str, object]] = {}
     legislator_party_label = ""
@@ -1252,6 +1248,13 @@ def main() -> None:
             file_name=f"{legislator.replace(' ', '_')}_{filter_mode.replace('/', '_').replace(' ', '_')}_summary.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             key="json_bullet_summary_download",
+        )
+    generate_workbook_clicked = False
+    if not filtered_df.empty:
+        generate_workbook_clicked = st.button(
+            "Generate all views workbook",
+            key="json_full_workbook_button",
+            help="Compile each predefined view into a single Excel workbook.",
         )
 
     if generate_workbook_clicked:
