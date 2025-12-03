@@ -1587,6 +1587,16 @@ def main() -> None:
         key="json_additional_legislators",
         help="Limit results to votes shared with these legislators (same roll call and filters).",
     )
+    if additional_legislators:
+        overlap_mode = st.sidebar.radio(
+            "Multi-legislator mode",
+            options=["Overlap (AND)", "Combined (OR)"],
+            index=0,
+            key="json_overlap_mode",
+            help="AND = only votes shared by every selected legislator; OR = concatenate each legislator's matching votes.",
+        )
+    else:
+        overlap_mode = "Overlap (AND)"
 
     filter_mode = st.sidebar.selectbox(
         "Vote type",
@@ -1799,12 +1809,39 @@ def main() -> None:
         "max_vote_diff": max_vote_diff,
     }
     try:
-        filtered_df, total_count = _filter_with_legislator_overlap(
-            legislator,
-            multi_legislator_data,
-            comparison_legislators,
-            common_filter_kwargs,
-        )
+        if comparison_legislators and overlap_mode == "Combined (OR)":
+            frames: List[pd.DataFrame] = []
+            names = [legislator] + comparison_legislators
+            total_count = 0
+            for name in names:
+                package = multi_legislator_data.get(name)
+                if package is None:
+                    continue
+                filtered_df_single, count_single = apply_filters_json(
+                    package["df"],
+                    **{
+                        **common_filter_kwargs,
+                        "sponsor_metadata": package.get("sponsor_metadata"),
+                        "selected_legislator": name,
+                        "legislator_party_label": package.get("legislator_party_label", ""),
+                    },
+                )
+                frames.append(filtered_df_single.assign(Person=name))
+                total_count += count_single
+            if not frames:
+                raise ValueError("No vote records found for the selected criteria.")
+            filtered_df = (
+                pd.concat(frames, ignore_index=True)
+                .sort_values(by=["Date", "Bill Number", "Roll Call ID", "Person"], kind="mergesort")
+                .reset_index(drop=True)
+            )
+        else:
+            filtered_df, total_count = _filter_with_legislator_overlap(
+                legislator,
+                multi_legislator_data,
+                comparison_legislators,
+                common_filter_kwargs,
+            )
     except ValueError as exc:
         st.warning(str(exc))
         st.stop()
