@@ -1360,6 +1360,20 @@ def _merge_legislator_metadata(
     return merged_sponsor, merged_bill_votes
 
 
+def _resolve_mode_metadata(
+    has_comparison: bool,
+    overlap_mode: str,
+    overlap_requirement: str,
+) -> Tuple[str, str]:
+    if not has_comparison:
+        return "Single legislator", "solo"
+    if overlap_mode == "Combined (OR)":
+        return "Combined (union of legislators)", "combined"
+    if overlap_requirement == "Main + any":
+        return "Overlap (main + any additional)", "overlap_main_any"
+    return "Overlap (all legislators)", "overlap_all"
+
+
 def _normalize_bill_marker(value: Optional[str]) -> str:
     if value is None:
         return ""
@@ -1902,6 +1916,11 @@ def main() -> None:
         "max_vote_diff": max_vote_diff,
     }
     allow_overlap_with_any = overlap_requirement == "Main + any"
+    mode_description, mode_slug = _resolve_mode_metadata(
+        bool(comparison_legislators),
+        overlap_mode,
+        overlap_requirement,
+    )
     try:
         if comparison_legislators and overlap_mode == "Combined (OR)":
             filtered_df, total_count = _union_legislator_results(
@@ -1923,14 +1942,14 @@ def main() -> None:
         st.stop()
 
     filtered_count = len(filtered_df)
-    overlap_note = ""
+    overlap_note = f" [{mode_description}]"
     if comparison_legislators:
         if overlap_mode == "Combined (OR)":
-            overlap_note = f" (combined with {len(comparison_legislators)} additional legislators)"
+            overlap_note += f" (combined with {len(comparison_legislators)} additional legislators)"
         elif allow_overlap_with_any:
-            overlap_note = f" (overlap across main legislator plus any of {len(comparison_legislators)} others)"
+            overlap_note += f" (overlap across main legislator plus any of {len(comparison_legislators)} others)"
         else:
-            overlap_note = f" (overlap across {1 + len(comparison_legislators)} legislators)"
+            overlap_note += f" (overlap across {1 + len(comparison_legislators)} legislators)"
     st.success(
         f"Compiled {total_count} votes for {legislator}. "
         f"Showing {filtered_count} after filters{overlap_note}."
@@ -1959,10 +1978,14 @@ def main() -> None:
     excel_rows = export_df.values.tolist()
     excel_buffer = io.BytesIO()
     write_workbook(excel_rows, legislator, excel_buffer)
+    votes_filename = f"{legislator.replace(' ', '_')}_JSON_Votes"
+    if mode_slug != "solo":
+        votes_filename += f"_{mode_slug}"
+    votes_filename += ".xlsx"
     st.download_button(
         label="Download filtered Excel sheet",
         data=excel_buffer.getvalue(),
-        file_name=f"{legislator.replace(' ', '_')}_JSON_Votes.xlsx",
+        file_name=votes_filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     if not filtered_df.empty:
@@ -1978,7 +2001,7 @@ def main() -> None:
         st.download_button(
             label="Download bullet summary",
             data=bullet_buffer.getvalue(),
-            file_name=f"{legislator.replace(' ', '_')}_{filter_mode.replace('/', '_').replace(' ', '_')}_summary.docx",
+            file_name=f"{legislator.replace(' ', '_')}_{filter_mode.replace('/', '_').replace(' ', '_')}_{mode_slug}_summary.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             key="json_bullet_summary_download",
         )
@@ -2065,10 +2088,14 @@ def main() -> None:
             workbook_buffer = io.BytesIO()
             write_multi_sheet_workbook(workbook_views, workbook_buffer)
             workbook_buffer.seek(0)
+            workbook_filename = f"{legislator.replace(' ', '_')}_JSON_full_workbook"
+            if mode_slug != "solo":
+                workbook_filename += f"_{mode_slug}"
+            workbook_filename += ".xlsx"
             st.download_button(
                 label="Download vote summary workbook",
                 data=workbook_buffer.getvalue(),
-                file_name=f"{legislator.replace(' ', '_')}_JSON_full_workbook.xlsx",
+                file_name=workbook_filename,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="json_full_workbook_download",
             )
