@@ -1378,7 +1378,7 @@ def _apply_filters_for_package(
     legislator_name: str,
     package: Dict[str, object],
     common_filter_kwargs: Dict[str, object],
-) -> Tuple[pd.DataFrame, int, List[Set[Tuple]], Set[Tuple]]:
+) -> Tuple[pd.DataFrame, int, List[Set[Tuple]], Set[Tuple], Dict[Tuple, Set[str]]]:
     df = package.get("df")
     if df is None:
         raise ValueError(f"No vote dataset available for {legislator_name}.")
@@ -1389,11 +1389,18 @@ def _apply_filters_for_package(
     filtered_df, total_count = apply_filters_json(df, **params)
     row_tokens: List[Set[Tuple]] = []
     combined_tokens: Set[Tuple] = set()
+    token_bucket_map: Dict[Tuple, Set[str]] = {}
     for _, row in filtered_df.iterrows():
         tokens = _row_overlap_tokens(row)
         row_tokens.append(tokens)
         combined_tokens.update(tokens)
-    return filtered_df, total_count, row_tokens, combined_tokens
+        vote_bucket = str(row.get("Vote Bucket") or "").strip().upper()
+        if not vote_bucket:
+            continue
+        for token in tokens:
+            bucket_set = token_bucket_map.setdefault(token, set())
+            bucket_set.add(vote_bucket)
+    return filtered_df, total_count, row_tokens, combined_tokens, token_bucket_map
 
 
 def _filter_with_legislator_overlap(
@@ -1410,11 +1417,13 @@ def _filter_with_legislator_overlap(
         total_count,
         primary_row_tokens,
         primary_token_set,
+        primary_token_bucket_map,
     ) = _apply_filters_for_package(
         primary_name,
         primary_package,
         common_filter_kwargs,
     )
+    bucket_maps: Dict[str, Dict[Tuple, Set[str]]] = {primary_name: primary_token_bucket_map}
     if not comparison_legislators:
         return primary_df, total_count
     overlap_tokens = set(primary_token_set)
@@ -1426,7 +1435,14 @@ def _filter_with_legislator_overlap(
         package = multi_legislator_data.get(comp_name)
         if package is None:
             raise ValueError(f"No cached dataset available for {comp_name}. Regenerate the summary.")
-        _, _, _, comp_tokens = _apply_filters_for_package(comp_name, package, common_filter_kwargs)
+        (
+            _,
+            _,
+            _,
+            comp_tokens,
+            comp_bucket_map,
+        ) = _apply_filters_for_package(comp_name, package, common_filter_kwargs)
+        bucket_maps[comp_name] = comp_bucket_map
         overlap_tokens &= comp_tokens
         if not overlap_tokens:
             break
@@ -1434,6 +1450,31 @@ def _filter_with_legislator_overlap(
         raise ValueError(
             "No overlapping votes found for the selected legislators with the current filters."
         )
+    filter_mode = common_filter_kwargs.get("filter_mode")
+    if comparison_legislators and filter_mode == "All Votes":
+        def _matching_vote(token: Tuple) -> bool:
+            consensus = None
+            for name in [primary_name] + comparison_legislators:
+                token_buckets = bucket_maps.get(name, {}).get(token)
+                if not token_buckets:
+                    return False
+                normalized = {bucket.strip().upper() for bucket in token_buckets if bucket}
+                if not normalized:
+                    return False
+                if len(normalized) > 1:
+                    return False
+                bucket_value = next(iter(normalized))
+                if consensus is None:
+                    consensus = bucket_value
+                elif bucket_value != consensus:
+                    return False
+            return True
+
+        overlap_tokens = {token for token in overlap_tokens if _matching_vote(token)}
+        if not overlap_tokens:
+            raise ValueError(
+                "No overlapping votes found where all selected legislators cast the same vote."
+            )
     mask = [
         bool(tokens & overlap_tokens)
         for tokens in primary_row_tokens
