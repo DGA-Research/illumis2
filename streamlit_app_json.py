@@ -1345,6 +1345,21 @@ def apply_filters_json(
     return filtered_df, pre_filter_count
 
 
+def _merge_legislator_metadata(
+    multi_legislator_data: Dict[str, Dict[str, object]],
+    names: List[str],
+) -> Tuple[Dict[Tuple[str, str], Dict[str, object]], Dict[Tuple[str, str], List[Dict[str, object]]]]:
+    merged_sponsor: Dict[Tuple[str, str], Dict[str, object]] = {}
+    merged_bill_votes: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+    for name in names:
+        package = multi_legislator_data.get(name)
+        if not package:
+            continue
+        merged_sponsor.update(package.get("sponsor_metadata", {}))
+        merged_bill_votes.update(package.get("bill_vote_metadata", {}))
+    return merged_sponsor, merged_bill_votes
+
+
 def _normalize_bill_marker(value: Optional[str]) -> str:
     if value is None:
         return ""
@@ -1403,11 +1418,49 @@ def _apply_filters_for_package(
     return filtered_df, total_count, row_tokens, combined_tokens, token_bucket_map
 
 
+def _union_legislator_results(
+    primary_name: str,
+    comparison_legislators: List[str],
+    multi_legislator_data: Dict[str, Dict[str, object]],
+    common_filter_kwargs: Dict[str, object],
+) -> Tuple[pd.DataFrame, int]:
+    frames: List[pd.DataFrame] = []
+    total_count = 0
+    names = [primary_name] + comparison_legislators
+    for name in names:
+        package = multi_legislator_data.get(name)
+        if package is None:
+            continue
+        df_single, count_single = apply_filters_json(
+            package["df"],
+            **{
+                **common_filter_kwargs,
+                "sponsor_metadata": package.get("sponsor_metadata"),
+                "selected_legislator": name,
+                "legislator_party_label": package.get("legislator_party_label", ""),
+            },
+        )
+        if df_single.empty:
+            continue
+        frames.append(df_single)
+        total_count += len(df_single)
+    if not frames:
+        raise ValueError("No vote records found for the selected criteria.")
+    combined = (
+        pd.concat(frames, ignore_index=True)
+        .sort_values(by=["Date", "Bill Number", "Roll Call ID", "Person"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    return combined, total_count
+
+
 def _filter_with_legislator_overlap(
     primary_name: str,
     multi_legislator_data: Dict[str, Dict[str, object]],
     comparison_legislators: List[str],
     common_filter_kwargs: Dict[str, object],
+    *,
+    allow_overlap_with_any: bool = False,
 ) -> Tuple[pd.DataFrame, int]:
     primary_package = multi_legislator_data.get(primary_name)
     if primary_package is None:
@@ -1432,11 +1485,18 @@ def _filter_with_legislator_overlap(
     }
     if not comparison_legislators:
         return primary_df, total_count
-    overlap_tokens = set(primary_token_set)
-    if not overlap_tokens:
-        raise ValueError(
-            "No qualifying roll-call or cross-file identifiers found for the primary legislator."
-        )
+    if allow_overlap_with_any:
+        overlap_tokens: Set[Tuple] = set()
+        if not primary_token_set:
+            raise ValueError(
+                "No qualifying roll-call or cross-file identifiers found for the primary legislator."
+            )
+    else:
+        overlap_tokens = set(primary_token_set)
+        if not overlap_tokens:
+            raise ValueError(
+                "No qualifying roll-call or cross-file identifiers found for the primary legislator."
+            )
     for comp_name in comparison_legislators:
         package = multi_legislator_data.get(comp_name)
         if package is None:
@@ -1453,7 +1513,11 @@ def _filter_with_legislator_overlap(
             "df": comp_df,
             "row_tokens": comp_row_tokens,
         }
-        overlap_tokens &= comp_tokens
+        comp_overlap = primary_token_set & comp_tokens
+        if allow_overlap_with_any:
+            overlap_tokens |= comp_overlap
+        else:
+            overlap_tokens &= comp_tokens
         if not overlap_tokens:
             break
     if not overlap_tokens:
@@ -1464,7 +1528,14 @@ def _filter_with_legislator_overlap(
     if comparison_legislators and filter_mode == "All Votes":
         def _matching_vote(token: Tuple) -> bool:
             consensus = None
-            for name in [primary_name] + comparison_legislators:
+            participants = [primary_name]
+            if allow_overlap_with_any:
+                participants += [
+                    name for name in comparison_legislators if token in bucket_maps.get(name, {})
+                ]
+            else:
+                participants += comparison_legislators
+            for name in participants:
                 token_buckets = bucket_maps.get(name, {}).get(token)
                 if not token_buckets:
                     return False
@@ -1595,8 +1666,18 @@ def main() -> None:
             key="json_overlap_mode",
             help="AND = only votes shared by every selected legislator; OR = concatenate each legislator's matching votes.",
         )
+        overlap_requirement = "All legislators"
+        if overlap_mode == "Overlap (AND)":
+            overlap_requirement = st.sidebar.radio(
+                "Overlap requirement",
+                options=["All legislators", "Main + any"],
+                index=0,
+                key="json_overlap_requirement",
+                help="Require votes shared by all selected legislators, or just the main legislator plus any additional member.",
+            )
     else:
         overlap_mode = "Overlap (AND)"
+        overlap_requirement = "All legislators"
 
     filter_mode = st.sidebar.selectbox(
         "Vote type",
@@ -1694,9 +1775,10 @@ def main() -> None:
     legislator_party_label = ""
 
     if generate_summary:
-        targets = [selected_legislator] + [
+        participants = [selected_legislator] + [
             name for name in additional_legislators if name != selected_legislator
         ]
+        targets = participants.copy()
         seen_targets: Set[str] = set()
         ordered_targets: List[str] = []
         for name in targets:
@@ -1715,9 +1797,11 @@ def main() -> None:
         primary_package = multi_legislator_data[selected_legislator]
         rows = primary_package["rows"]
         summary_df = primary_package["df"]
-        sponsor_metadata = primary_package.get("sponsor_metadata", {})
+        sponsor_metadata, bill_vote_metadata = _merge_legislator_metadata(
+            multi_legislator_data,
+            participants,
+        )
         legislator_party_label = primary_package.get("legislator_party_label", "")
-        bill_vote_metadata = primary_package.get("bill_vote_metadata", {})
         st.session_state[SESSION_CACHE_KEY] = {
             "rows": rows,
             "df": summary_df,
@@ -1727,6 +1811,7 @@ def main() -> None:
             "legislator_party_label": legislator_party_label,
             "bill_vote_metadata": bill_vote_metadata,
             "multi_legislator_data": multi_legislator_data,
+            "merged_participants": participants,
             "additional_legislators": additional_legislators,
         }
 
@@ -1769,9 +1854,17 @@ def main() -> None:
         st.session_state[SESSION_CACHE_KEY] = cached
     rows = primary_package.get("rows", [])
     summary_df = primary_package.get("df")
-    sponsor_metadata = primary_package.get("sponsor_metadata", {})
+    cached_participants = cached.get("merged_participants")
+    if not cached_participants:
+        cached_participants = [legislator] + cached.get("additional_legislators", [])
+    sponsor_metadata = cached.get("sponsor_metadata")
+    bill_vote_metadata = cached.get("bill_vote_metadata")
+    if sponsor_metadata is None or bill_vote_metadata is None:
+        sponsor_metadata, bill_vote_metadata = _merge_legislator_metadata(
+            multi_legislator_data,
+            cached_participants,
+        )
     legislator_party_label = primary_package.get("legislator_party_label", "")
-    bill_vote_metadata = primary_package.get("bill_vote_metadata", {})
     if "Sponsorship Status" not in summary_df.columns:
         summary_df["Sponsorship Status"] = ""
 
@@ -1808,32 +1901,14 @@ def main() -> None:
         "min_group_votes": min_group_votes,
         "max_vote_diff": max_vote_diff,
     }
+    allow_overlap_with_any = overlap_requirement == "Main + any"
     try:
         if comparison_legislators and overlap_mode == "Combined (OR)":
-            frames: List[pd.DataFrame] = []
-            names = [legislator] + comparison_legislators
-            total_count = 0
-            for name in names:
-                package = multi_legislator_data.get(name)
-                if package is None:
-                    continue
-                filtered_df_single, count_single = apply_filters_json(
-                    package["df"],
-                    **{
-                        **common_filter_kwargs,
-                        "sponsor_metadata": package.get("sponsor_metadata"),
-                        "selected_legislator": name,
-                        "legislator_party_label": package.get("legislator_party_label", ""),
-                    },
-                )
-                frames.append(filtered_df_single.assign(Person=name))
-                total_count += count_single
-            if not frames:
-                raise ValueError("No vote records found for the selected criteria.")
-            filtered_df = (
-                pd.concat(frames, ignore_index=True)
-                .sort_values(by=["Date", "Bill Number", "Roll Call ID", "Person"], kind="mergesort")
-                .reset_index(drop=True)
+            filtered_df, total_count = _union_legislator_results(
+                legislator,
+                comparison_legislators,
+                multi_legislator_data,
+                common_filter_kwargs,
             )
         else:
             filtered_df, total_count = _filter_with_legislator_overlap(
@@ -1841,6 +1916,7 @@ def main() -> None:
                 multi_legislator_data,
                 comparison_legislators,
                 common_filter_kwargs,
+                allow_overlap_with_any=allow_overlap_with_any,
             )
     except ValueError as exc:
         st.warning(str(exc))
@@ -1849,7 +1925,12 @@ def main() -> None:
     filtered_count = len(filtered_df)
     overlap_note = ""
     if comparison_legislators:
-        overlap_note = f" (overlap across {1 + len(comparison_legislators)} legislators)"
+        if overlap_mode == "Combined (OR)":
+            overlap_note = f" (combined with {len(comparison_legislators)} additional legislators)"
+        elif allow_overlap_with_any:
+            overlap_note = f" (overlap across main legislator plus any of {len(comparison_legislators)} others)"
+        else:
+            overlap_note = f" (overlap across {1 + len(comparison_legislators)} legislators)"
     st.success(
         f"Compiled {total_count} votes for {legislator}. "
         f"Showing {filtered_count} after filters{overlap_note}."
@@ -1949,15 +2030,25 @@ def main() -> None:
             elif view_name == "Deciding Votes":
                 params.update({"max_vote_diff": stored_deciding_max_diff})
             try:
-                sheet_df, _ = _filter_with_legislator_overlap(
-                    legislator,
-                    multi_legislator_data,
-                    comparison_legislators,
-                    {
-                        "filter_mode": view_name,
-                        **params,
-                    },
-                )
+                view_filter_kwargs = {
+                    "filter_mode": view_name,
+                    **params,
+                }
+                if comparison_legislators and overlap_mode == "Combined (OR)":
+                    sheet_df, _ = _union_legislator_results(
+                        legislator,
+                        comparison_legislators,
+                        multi_legislator_data,
+                        view_filter_kwargs,
+                    )
+                else:
+                    sheet_df, _ = _filter_with_legislator_overlap(
+                        legislator,
+                        multi_legislator_data,
+                        comparison_legislators,
+                        view_filter_kwargs,
+                        allow_overlap_with_any=overlap_requirement == "Main + any",
+                    )
             except ValueError:
                 empty_views.append(view_name)
                 continue
