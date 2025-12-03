@@ -1424,6 +1424,12 @@ def _filter_with_legislator_overlap(
         common_filter_kwargs,
     )
     bucket_maps: Dict[str, Dict[Tuple, Set[str]]] = {primary_name: primary_token_bucket_map}
+    per_legislator_rows: Dict[str, Dict[str, object]] = {
+        primary_name: {
+            "df": primary_df,
+            "row_tokens": primary_row_tokens,
+        }
+    }
     if not comparison_legislators:
         return primary_df, total_count
     overlap_tokens = set(primary_token_set)
@@ -1436,13 +1442,17 @@ def _filter_with_legislator_overlap(
         if package is None:
             raise ValueError(f"No cached dataset available for {comp_name}. Regenerate the summary.")
         (
+            comp_df,
             _,
-            _,
-            _,
+            comp_row_tokens,
             comp_tokens,
             comp_bucket_map,
         ) = _apply_filters_for_package(comp_name, package, common_filter_kwargs)
         bucket_maps[comp_name] = comp_bucket_map
+        per_legislator_rows[comp_name] = {
+            "df": comp_df,
+            "row_tokens": comp_row_tokens,
+        }
         overlap_tokens &= comp_tokens
         if not overlap_tokens:
             break
@@ -1475,15 +1485,40 @@ def _filter_with_legislator_overlap(
             raise ValueError(
                 "No overlapping votes found where all selected legislators cast the same vote."
             )
-    mask = [
-        bool(tokens & overlap_tokens)
-        for tokens in primary_row_tokens
-    ]
-    filtered_subset = primary_df.loc[mask].copy()
-    if filtered_subset.empty:
+    combined_frames: List[pd.DataFrame] = []
+    def _build_subset(name: str) -> Optional[pd.DataFrame]:
+        entry = per_legislator_rows.get(name)
+        if entry is None:
+            return None
+        tokens_list = entry["row_tokens"]
+        df = entry["df"]
+        local_mask = [
+            bool(token_set & overlap_tokens)
+            for token_set in tokens_list
+        ]
+        if not local_mask:
+            return None
+        subset = df.loc[local_mask].copy()
+        if subset.empty:
+            return None
+        return subset
+
+    sequence = [primary_name] + comparison_legislators
+    for name in sequence:
+        subset = _build_subset(name)
+        if subset is not None and not subset.empty:
+            combined_frames.append(subset)
+
+    if not combined_frames:
         raise ValueError(
             "Overlapping votes were identified, but none remained after applying all filters."
         )
+    filtered_subset = pd.concat(combined_frames, ignore_index=True)
+    filtered_subset = filtered_subset.sort_values(
+        by=["Date", "Bill Number", "Roll Call ID", "Person"],
+        kind="mergesort",
+        na_position="last",
+    ).reset_index(drop=True)
     return filtered_subset, total_count
 
 
