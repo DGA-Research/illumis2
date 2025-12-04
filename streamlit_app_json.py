@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import streamlit as st
+from streamlit.delta_generator import DeltaGenerator
 from openpyxl import Workbook
 from docx import Document
 from docx.shared import Inches, Pt
@@ -351,7 +352,7 @@ def _prepare_dataframe(rows: List[List]) -> pd.DataFrame:
     return df
 
 
-def _render_state_filter() -> Tuple[List[str], List[str]]:
+def _render_state_filter() -> Tuple[List[str], List[str], DeltaGenerator]:
     st.sidebar.header("Dataset Selection")
     selection = st.sidebar.selectbox(
         "State",
@@ -360,9 +361,10 @@ def _render_state_filter() -> Tuple[List[str], List[str]]:
         placeholder="Select a state",
         help="Choose a single state to load its JSON archives.",
     )
+    state_note_slot = st.sidebar.empty()
     if selection:
-        return [selection], [STATE_NAME_TO_CODE[selection]]
-    return [], []
+        return [selection], [STATE_NAME_TO_CODE[selection]], state_note_slot
+    return [], [], state_note_slot
 
 
 def _collect_archives_for_states(state_codes: List[str]) -> List[str]:
@@ -393,6 +395,68 @@ def _collect_archives_for_states(state_codes: List[str]) -> List[str]:
         if code in state_codes:
             selected.append(path.name)
     return selected
+
+
+def _parse_json_date_to_date(value: Optional[str]) -> Optional[dt.date]:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    iso_candidate = _parse_iso8601(text)
+    if iso_candidate:
+        return iso_candidate.date()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return dt.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    try:
+        return dt.datetime.fromisoformat(text).date()
+    except ValueError:
+        return None
+
+
+def _latest_bill_action_date(bill: dict) -> Optional[dt.date]:
+    latest_date: Optional[dt.date] = None
+    history_entries = bill.get("history") or []
+    for entry in history_entries:
+        date_value = _parse_json_date_to_date(entry.get("date"))
+        if date_value and (latest_date is None or date_value > latest_date):
+            latest_date = date_value
+    for field in ("status_date", "last_action_date"):
+        date_value = _parse_json_date_to_date(bill.get(field))
+        if date_value and (latest_date is None or date_value > latest_date):
+            latest_date = date_value
+    return latest_date
+
+
+def _collect_latest_action_date_json(archive_paths: List[Path]) -> Optional[dt.date]:
+    if not archive_paths:
+        return None
+    extracted = extract_archives(archive_paths)
+    try:
+        base_dirs = [item.base_path for item in extracted]
+        try:
+            session_dirs = gather_json_session_dirs(base_dirs)
+        except FileNotFoundError:
+            return None
+        latest_date: Optional[dt.date] = None
+        for session_dir in session_dirs:
+            bill_dir = Path(session_dir) / "bill"
+            if not bill_dir.exists():
+                continue
+            for bill_path in bill_dir.glob("*.json"):
+                with bill_path.open(encoding="utf-8") as fh:
+                    data = json.load(fh)
+                bill = data.get("bill") or {}
+                candidate = _latest_bill_action_date(bill)
+                if candidate and (latest_date is None or candidate > latest_date):
+                    latest_date = candidate
+        return latest_date
+    finally:
+        for item in extracted:
+            item.cleanup()
 
 
 PARTY_CODE_MAP = {
@@ -1621,7 +1685,12 @@ def main() -> None:
             """
         )
 
-    state_labels, state_codes = _render_state_filter()
+    state_labels, state_codes, state_note_slot = _render_state_filter()
+    if state_codes:
+        base_note_message = "Resolving archives to determine the latest bill action date..."
+    else:
+        base_note_message = "Select a state to view the latest bill action date."
+    state_note_slot.caption(base_note_message)
     if not state_codes:
         st.info("Select at least one state to continue.")
         st.stop()
@@ -1630,6 +1699,7 @@ def main() -> None:
     if not selected_archive_names:
         readable_states = ", ".join(state_labels)
         st.warning(f"No JSON archives found for: {readable_states}.")
+        state_note_slot.caption(f"No JSON archives were found for {readable_states}.")
         st.stop()
 
     archives_snapshot = tuple(sorted(selected_archive_names))
@@ -1638,7 +1708,25 @@ def main() -> None:
         selected_paths = _resolve_archives(selected_archive_names)
     except FileNotFoundError as exc:
         st.error(str(exc))
+        state_note_slot.caption("Unable to access the selected archives.")
         st.stop()
+    state_label_display = ", ".join(state_labels) if state_labels else "Selected state"
+    latest_action_date: Optional[dt.date] = None
+    try:
+        latest_action_date = _collect_latest_action_date_json(selected_paths)
+    except Exception:
+        latest_action_date = None
+    if latest_action_date:
+        formatted_date = latest_action_date.strftime("%B %d, %Y")
+        state_note_message = (
+            f"{state_label_display} latest bill action "
+            f"(most recent in-session record): {formatted_date}."
+        )
+    else:
+        state_note_message = (
+            f"No bill action dates were found in the selected archives for {state_label_display}."
+        )
+    state_note_slot.caption(state_note_message)
 
     paths_snapshot = tuple(str(path) for path in selected_paths)
     with st.spinner("Discovering legislators..."):
