@@ -51,6 +51,15 @@ The `Sponsored/Cosponsored Bills` view deduplicates by LegiScan `bill_id` so eac
 ## Managing Bundled Archives
 Archives saved under `bulkLegiData` appear in the sidebar selector. Use **Select all bundled** or **Clear bundled** to manage the current choice. When `st.secrets["github"]` credentials are provided, newly saved archives are automatically uploaded to the configured GitHub repository; otherwise they remain local for reuse in future sessions.
 
+## Remote JSON Archives (GCS)
+The JSON beta app no longer requires large ZIPs to live inside the repository. Set the following environment variables (or add them to `.streamlit/secrets.toml`) to host archives in Google Cloud Storage instead:
+
+- `ILLUMIS_GCS_BUCKET` – required; bucket that stores the JSON ZIPs and manifest.
+- `ILLUMIS_GCS_MANIFEST` – optional; blob name (default `manifest.json`) containing a JSON object that maps state codes (e.g., `"MN"`) to lists of archive descriptors. Each descriptor can be either the blob path string or an object with `blob_path`, `name`, `updated`, and `size`.
+- `ILLUMIS_ARCHIVE_CACHE_DIR` – optional; local cache directory for downloaded ZIPs (defaults to the system temp dir).
+
+When these variables are present, the app lists archives per selected state by reading the manifest, downloads only the needed ZIPs into the cache, and reuses them until the manifest reports a newer `updated` value.
+
 ## Troubleshooting
 - **Invalid ZIP** - Streamlit highlights the archive; re-download it and try again.
 - **Mixed states detected** - Upload archives from only one state at a time; remove out-of-state files before rerunning.

@@ -1,6 +1,9 @@
 import io
 import json
+import os
+import tempfile
 import datetime as dt
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -13,6 +16,16 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE
 
+try:
+    pd.set_option("future.no_silent_downcasting", True)
+except Exception:
+    pass
+
+try:
+    from google.cloud import storage
+except ImportError:  # pragma: no cover - optional dependency for remote archives
+    storage = None
+
 from generate_kristin_robbins_votes import WORKBOOK_HEADERS, write_workbook
 from json_legiscan_loader import (
     collect_legislator_names_json,
@@ -20,11 +33,184 @@ from json_legiscan_loader import (
     extract_archives,
     gather_json_session_dirs,
 )
-from json_vote_builder import STATUS_LABELS, collect_vote_rows_from_json
+from json_vote_builder import STATUS_LABELS, collect_vote_rows_from_json, extract_crossfile_fields
 
-JSON_DATA_DIR = Path(__file__).resolve().parent / "JSON DATA"
+
+def _settings_value(key: str, default: Optional[str] = None) -> Optional[str]:
+    secrets_obj = getattr(st, "secrets", None)
+    if secrets_obj and key in secrets_obj:
+        return secrets_obj[key]
+    return os.environ.get(key, default)
+
+
+def _service_account_info() -> Optional[Dict[str, object]]:
+    secrets_obj = getattr(st, "secrets", None)
+    if not secrets_obj or "gcp_service_account" not in secrets_obj:
+        return None
+    raw_info = secrets_obj["gcp_service_account"]
+    if hasattr(raw_info, "to_dict"):
+        return raw_info.to_dict()
+    if isinstance(raw_info, dict):
+        return raw_info.copy()
+    try:
+        return dict(raw_info)
+    except TypeError:
+        return None
+
+
+DEFAULT_JSON_DATA_DIR = Path(__file__).resolve().parent / "JSON DATA"
+GCS_BUCKET_NAME = _settings_value("ILLUMIS_GCS_BUCKET")
+GCS_MANIFEST_BLOB = _settings_value("ILLUMIS_GCS_MANIFEST", "manifest.json")
+archive_cache_setting = _settings_value(
+    "ILLUMIS_ARCHIVE_CACHE_DIR",
+    str(Path(tempfile.gettempdir()) / "legiscan-json-archives"),
+)
+ARCHIVE_CACHE_DIR = Path(archive_cache_setting)
+ARCHIVE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+service_account = _service_account_info()
+if service_account:
+    creds_path = ARCHIVE_CACHE_DIR / "gcs-creds.json"
+    creds_path.write_text(json.dumps(service_account))
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
+    project_id = service_account.get("project_id")
+    if project_id:
+        os.environ.setdefault("GOOGLE_CLOUD_PROJECT", project_id)
+
+USE_REMOTE_ARCHIVES = bool(GCS_BUCKET_NAME)
+JSON_DATA_DIR = DEFAULT_JSON_DATA_DIR if not USE_REMOTE_ARCHIVES else ARCHIVE_CACHE_DIR
+
 SESSION_CACHE_KEY = "json_vote_summary"
 ALL_STATES_LABEL = "All States"
+
+
+@lru_cache(maxsize=1)
+def _storage_client():
+    if storage is None:
+        raise RuntimeError(
+            "google-cloud-storage is required when ILLUMIS_GCS_BUCKET is configured."
+        )
+    return storage.Client()
+
+
+def _parse_iso8601(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    text = text.replace("Z", "+00:00")
+    try:
+        return dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _normalize_manifest_entry(state_code: str, entry: object) -> Optional[Dict[str, object]]:
+    if isinstance(entry, str):
+        blob_path = entry
+        name = Path(entry).name
+        updated = None
+        size = None
+    elif isinstance(entry, dict):
+        blob_path = (
+            entry.get("blob_path")
+            or entry.get("blob")
+            or entry.get("path")
+            or entry.get("name")
+        )
+        name = entry.get("name") or (Path(blob_path).name if blob_path else None)
+        updated = entry.get("updated") or entry.get("last_modified")
+        size = entry.get("size")
+    else:
+        return None
+    if not blob_path or not name:
+        return None
+    return {
+        "state": state_code,
+        "name": name,
+        "blob_path": blob_path,
+        "updated": updated,
+        "size": size,
+    }
+
+
+def _build_manifest(payload: object) -> Dict[str, List[Dict[str, object]]]:
+    manifest: Dict[str, List[Dict[str, object]]] = {}
+    if isinstance(payload, dict):
+        items = payload.items()
+    elif isinstance(payload, list):
+        items = (
+            ((entry.get("state") or "").strip().upper(), [entry])
+            for entry in payload
+            if isinstance(entry, dict)
+        )
+    else:
+        raise ValueError(
+            "GCS manifest must be a JSON object keyed by state codes or a list of state entries."
+        )
+    for state_key, entries in items:
+        code = (state_key or "").strip().upper()
+        if not code:
+            continue
+        normalized_entries: List[Dict[str, object]] = []
+        if not isinstance(entries, list):
+            entries = [entries]
+        for entry in entries:
+            normalized = _normalize_manifest_entry(code, entry)
+            if normalized:
+                normalized_entries.append(normalized)
+        if normalized_entries:
+            manifest[code] = normalized_entries
+    return manifest
+
+
+@lru_cache(maxsize=1)
+def _cached_manifest() -> Dict[str, List[Dict[str, object]]]:
+    if not USE_REMOTE_ARCHIVES:
+        return {}
+    client = _storage_client()
+    bucket = client.bucket(GCS_BUCKET_NAME)
+    blob = bucket.blob(GCS_MANIFEST_BLOB)
+    payload = json.loads(blob.download_as_text())
+    return _build_manifest(payload)
+
+
+@lru_cache(maxsize=1)
+def _remote_archive_lookup() -> Dict[str, Dict[str, object]]:
+    lookup: Dict[str, Dict[str, object]] = {}
+    for entries in _cached_manifest().values():
+        for entry in entries:
+            lookup[entry["name"]] = entry
+    return lookup
+
+
+def _ensure_remote_archive(entry: Dict[str, object]) -> Path:
+    ARCHIVE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    local_path = ARCHIVE_CACHE_DIR / str(entry["name"])
+    updated = _parse_iso8601(entry.get("updated"))
+    if local_path.exists() and updated:
+        normalized_updated = (
+            updated if updated.tzinfo else updated.replace(tzinfo=dt.timezone.utc)
+        )
+        updated_ts = normalized_updated.timestamp()
+        if local_path.stat().st_mtime >= updated_ts:
+            return local_path
+    elif local_path.exists():
+        return local_path
+    client = _storage_client()
+    bucket = client.bucket(GCS_BUCKET_NAME)
+    blob = bucket.blob(str(entry["blob_path"]))
+    tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+    blob.download_to_filename(tmp_path)
+    tmp_path.replace(local_path)
+    if updated:
+        normalized_updated = (
+            updated if updated.tzinfo else updated.replace(tzinfo=dt.timezone.utc)
+        )
+        timestamp = normalized_updated.timestamp()
+        os.utime(local_path, (timestamp, timestamp))
+    return local_path
 STATE_CHOICES = [
     ("Alabama", "AL"),
     ("Alaska", "AK"),
@@ -105,11 +291,33 @@ WORKBOOK_VIEWS = [
 
 
 def _resolve_archives(selected_names: List[str]) -> List[Path]:
-    lookup = {path.name: path for path in JSON_DATA_DIR.glob("*.zip")}
+    if USE_REMOTE_ARCHIVES:
+        lookup = _remote_archive_lookup()
+        missing = [name for name in selected_names if name not in lookup]
+        if missing:
+            raise FileNotFoundError(f"Missing archive(s) in manifest: {', '.join(missing)}")
+        return [_ensure_remote_archive(lookup[name]) for name in selected_names]
+
+    lookup = {path.name: path for path in DEFAULT_JSON_DATA_DIR.glob("*.zip")}
     missing = [name for name in selected_names if name not in lookup]
     if missing:
         raise FileNotFoundError(f"Missing archive(s): {', '.join(missing)}")
     return [lookup[name] for name in selected_names]
+
+
+@st.cache_data(show_spinner=False)
+def load_legislators_for_archives(archive_names: Tuple[str, ...]) -> Tuple[List[str], Optional[str]]:
+    selected_paths = [Path(name) for name in archive_names]
+    extracted = extract_archives(selected_paths)
+    try:
+        base_dirs = [item.base_path for item in extracted]
+        session_dirs = gather_json_session_dirs(base_dirs)
+        dataset_state = determine_json_state(session_dirs)
+        names = collect_legislator_names_json(session_dirs)
+        return names, dataset_state
+    finally:
+        for item in extracted:
+            item.cleanup()
 
 
 def _load_legislator_names(selected_paths: List[Path]) -> Tuple[List[str], Optional[str]]:
@@ -145,24 +353,39 @@ def _prepare_dataframe(rows: List[List]) -> pd.DataFrame:
 
 def _render_state_filter() -> Tuple[List[str], List[str]]:
     st.sidebar.header("Dataset Selection")
-    state_labels = st.sidebar.multiselect(
-        "State(s)",
+    selection = st.sidebar.selectbox(
+        "State",
         options=[name for name, _ in STATE_CHOICES],
-        default=[],
-        help="Choose one or more states to load their JSON archives.",
+        index=None,
+        placeholder="Select a state",
+        help="Choose a single state to load its JSON archives.",
     )
-    state_codes = [STATE_NAME_TO_CODE[label] for label in state_labels]
-    return state_labels, state_codes
+    if selection:
+        return [selection], [STATE_NAME_TO_CODE[selection]]
+    return [], []
 
 
 def _collect_archives_for_states(state_codes: List[str]) -> List[str]:
-    available_archives = sorted(JSON_DATA_DIR.glob("*.zip"))
-    if not available_archives:
-        st.error(f"No JSON ZIP archives found in {JSON_DATA_DIR}.")
-        st.stop()
-
     if not state_codes:
         return []
+
+    if USE_REMOTE_ARCHIVES:
+        manifest = _cached_manifest()
+        if not manifest:
+            st.error(
+                "No JSON archives are listed in the configured GCS manifest. "
+                "Confirm ILLUMIS_GCS_BUCKET and ILLUMIS_GCS_MANIFEST are correct."
+            )
+            st.stop()
+        selected: List[str] = []
+        for code in state_codes:
+            selected.extend([entry["name"] for entry in manifest.get(code, [])])
+        return selected
+
+    available_archives = sorted(DEFAULT_JSON_DATA_DIR.glob("*.zip"))
+    if not available_archives:
+        st.error(f"No JSON ZIP archives found in {DEFAULT_JSON_DATA_DIR}.")
+        st.stop()
 
     selected: List[str] = []
     for path in available_archives:
@@ -216,6 +439,29 @@ def _format_roll_details_json(vote_entry: Optional[dict]) -> str:
     return f"{desc}{suffix}" if desc else suffix.strip()
 
 
+def _normalize_chamber_label(value: Optional[str]) -> str:
+    token = (value or "").strip()
+    if not token:
+        return "Chamber"
+    upper = token.upper()
+    if upper in {"H", "HOUSE", "LOWER"}:
+        return "House"
+    if upper in {"S", "SENATE", "UPPER"}:
+        return "Senate"
+    return token
+
+
+def _parse_bill_id_list(raw_text: str) -> List[str]:
+    if not raw_text:
+        return []
+    normalized: List[str] = []
+    for part in raw_text.replace("\r", "\n").replace(",", "\n").split("\n"):
+        value = part.strip()
+        if value:
+            normalized.append(value)
+    return normalized
+
+
 def _latest_history_entry_json(history: Optional[List[dict]]) -> Tuple[str, str]:
     if not history:
         return "", ""
@@ -258,10 +504,13 @@ def _build_json_sponsor_metadata(bill: dict, status: str) -> Dict[str, object]:
         elif body_token == "S":
             chamber_value = "Senate"
     excel_date = roll_date or status_date or last_action_date
+    crossfile_id, crossfile_number = extract_crossfile_fields(bill)
     return {
         "session_id": session_label,
         "bill_number": bill_number,
         "bill_id": bill_id,
+        "crossfile_bill_id": crossfile_id,
+        "crossfile_bill_number": crossfile_number,
         "bill_title": title,
         "bill_description": description,
         "bill_motion": bill_motion,
@@ -321,15 +570,21 @@ def write_multi_sheet_workbook(
 def _collect_sponsor_lookup_json(
     archive_paths: List[Path],
     legislator_name: str,
-) -> Tuple[Dict[Tuple[str, str], str], Dict[Tuple[str, str], Dict[str, object]], str]:
+) -> Tuple[
+    Dict[Tuple[str, str], str],
+    Dict[Tuple[str, str], Dict[str, object]],
+    str,
+    Dict[Tuple[str, str], List[Dict[str, object]]],
+]:
     if not archive_paths:
-        return {}, {}, ""
+        return {}, {}, "", {}
     extracted = extract_archives(archive_paths)
     try:
         base_dirs = [item.base_path for item in extracted]
         session_dirs = gather_json_session_dirs(base_dirs)
         sponsor_lookup: Dict[Tuple[str, str], str] = {}
         sponsor_metadata: Dict[Tuple[str, str], Dict[str, object]] = {}
+        bill_vote_metadata: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
         legislator_party_label = ""
         target = legislator_name.strip()
         for session_dir in session_dirs:
@@ -345,7 +600,11 @@ def _collect_sponsor_lookup_json(
                 bill_number = str(bill.get("bill_number") or "").strip()
                 if not session_label or not bill_number:
                     continue
-                key = (session_label, bill_number)
+                bill_id = str(bill.get("bill_id") or "").strip()
+                if not bill_id:
+                    continue
+                key = (session_label, bill_id)
+                bill_vote_metadata[key] = bill.get("votes") or []
                 for sponsor in bill.get("sponsors") or []:
                     name = (sponsor.get("name") or "").strip()
                     if name != target:
@@ -365,7 +624,7 @@ def _collect_sponsor_lookup_json(
                         sponsor_metadata[key] = new_meta
                     elif meta.get("sponsorship_status") != "Primary Sponsor":
                         sponsor_metadata[key]["sponsorship_status"] = status
-        return sponsor_lookup, sponsor_metadata, legislator_party_label
+        return sponsor_lookup, sponsor_metadata, legislator_party_label, bill_vote_metadata
     finally:
         for item in extracted:
             item.cleanup()
@@ -383,6 +642,7 @@ def _create_sponsor_only_rows(
     for idx, (key, meta) in enumerate(sponsor_metadata.items()):
         if key in existing_keys:
             continue
+        session_label, sponsor_bill_id = key
         roll_call_value = meta.get("roll_call_id", "")
         try:
             normalized_roll_id = int(str(roll_call_value))
@@ -396,7 +656,9 @@ def _create_sponsor_only_rows(
                 "Chamber": meta.get("chamber", ""),
                 "Session": meta.get("session_id", ""),
                 "Bill Number": meta.get("bill_number", ""),
-                "Bill ID": meta.get("bill_id", ""),
+                "Bill ID": meta.get("bill_id") or sponsor_bill_id or "",
+                "Cross-file Bill ID": meta.get("crossfile_bill_id", ""),
+                "Cross-file Bill Number": meta.get("crossfile_bill_number", ""),
                 "Bill Motion": meta.get("bill_motion", "") or meta.get("bill_title", ""),
                 "URL": meta.get("bill_url", ""),
                 "Bill Title": meta.get("bill_title", ""),
@@ -421,6 +683,36 @@ def _create_sponsor_only_rows(
             }
         )
     return rows
+
+
+def _build_legislator_dataset(
+    selected_paths: List[Path],
+    legislator_name: str,
+) -> Dict[str, object]:
+    rows = _build_vote_rows(selected_paths, legislator_name)
+    summary_df = _prepare_dataframe(rows)
+    (
+        sponsor_lookup,
+        sponsor_metadata,
+        legislator_party_label,
+        bill_vote_metadata,
+    ) = _collect_sponsor_lookup_json(
+        selected_paths,
+        legislator_name,
+    )
+    session_series = summary_df["Session"].astype(str)
+    bill_id_series = summary_df["Bill ID"].astype(str)
+    summary_df["Sponsorship Status"] = [
+        sponsor_lookup.get((session, bill_id), "")
+        for session, bill_id in zip(session_series, bill_id_series)
+    ]
+    return {
+        "rows": rows,
+        "df": summary_df,
+        "sponsor_metadata": sponsor_metadata,
+        "legislator_party_label": legislator_party_label,
+        "bill_vote_metadata": bill_vote_metadata,
+    }
 
 
 def _add_hyperlink(paragraph, url: str, text: str) -> None:
@@ -484,7 +776,12 @@ def _build_json_bullet_summary_doc(
     legislator_name: str,
     filter_label: str,
     state_label: str,
+    *,
+    bill_vote_metadata: Optional[Dict[Tuple[str, str], List[Dict[str, object]]]] = None,
+    full_summary_df: Optional[pd.DataFrame] = None,
+    include_amendments: bool = False,
 ) -> io.BytesIO:
+    bill_vote_metadata = bill_vote_metadata or {}
     doc = Document()
     for section in doc.sections:
         section.top_margin = Inches(0.5)
@@ -506,30 +803,86 @@ def _build_json_bullet_summary_doc(
             working_rows["Date_dt"] = pd.to_datetime(
                 working_rows.get("Date"), errors="coerce"
             )
+        working_rows = working_rows.sort_values(
+            by=["Date_dt", "Roll Call ID"] if "Roll Call ID" in working_rows.columns else ["Date_dt"],
+            kind="mergesort",
+            na_position="last",
+        )
+
+        bill_rows_map: Dict[Tuple[str, str], List[pd.Series]] = {}
+        bill_context_row: Dict[Tuple[str, str], pd.Series] = {}
+        ordered_bill_keys: List[Tuple[str, str]] = []
         for _, row in working_rows.iterrows():
-            vote_dt = row.get("Date_dt")
-            if pd.isna(vote_dt):
-                display_date = (row.get("Date") or "").strip()
-            else:
-                display_date = vote_dt.strftime("%B %d, %Y")
+            session_label = str(row.get("Session") or "").strip()
+            bill_id = str(row.get("Bill ID") or "").strip()
+            if not session_label or not bill_id:
+                continue
+            key = (session_label, bill_id)
+            bill_rows_map.setdefault(key, []).append(row)
+            if key not in bill_context_row:
+                bill_context_row[key] = row
+                ordered_bill_keys.append(key)
 
-            vote_bucket = row.get("Vote Bucket", "")
-            vote_upper, vote_lower = _resolve_vote_phrases(vote_bucket)
+        vote_row_lookup: Dict[int, pd.Series] = {}
+        source_df = full_summary_df if full_summary_df is not None else working_rows
+        if source_df is not None:
+            for _, src_row in source_df.iterrows():
+                roll_call_identifier = safe_int(src_row.get("Roll Call ID"))
+                if roll_call_identifier:
+                    vote_row_lookup[roll_call_identifier] = src_row
 
-            bill_number = (row.get("Bill Number") or "").strip() or "Unknown bill"
-            bill_title = (row.get("Bill Title") or "").strip()
-            bill_description = (row.get("Bill Description") or bill_title or "").strip()
+        for key in ordered_bill_keys:
+            context_row = bill_context_row.get(key)
+            if context_row is None:
+                continue
+            bill_number = (context_row.get("Bill Number") or "").strip() or "Unknown bill"
+            bill_title = (context_row.get("Bill Title") or "").strip()
+            bill_description = (context_row.get("Bill Description") or bill_title or "").strip()
             if bill_description:
                 bill_description = bill_description.rstrip(".")
-            chamber = (row.get("Chamber") or "").strip() or "Chamber"
-            last_action = (row.get("Last Action") or row.get("Status Description") or "").strip()
-            sponsorship = (row.get("Sponsorship Status") or "").strip()
-            result_value = row.get("Result")
-            result_text = "Passed" if safe_int(result_value) == 1 else "Did not pass"
+            sponsorship = (context_row.get("Sponsorship Status") or "").strip()
+            last_action = (context_row.get("Last Action") or context_row.get("Status Description") or "").strip()
+            roll_call_entries = bill_vote_metadata.get(key) or []
+            if not include_amendments:
+                roll_call_entries = [
+                    entry
+                    for entry in roll_call_entries
+                    if not _is_amendment_roll_call_entry(entry)
+                ]
+
+            bill_rows = bill_rows_map.get(key, [])
+            non_amendment_rows = bill_rows
+            if not include_amendments:
+                non_amendment_rows = [
+                    row for row in bill_rows if not _is_amendment_row(row)
+                ]
+
+            if not roll_call_entries and not non_amendment_rows:
+                continue
 
             paragraph = doc.add_paragraph()
             paragraph.paragraph_format.space_after = Pt(12)
             paragraph.paragraph_format.space_before = Pt(0)
+
+            header_row = None
+            if roll_call_entries:
+                for entry in roll_call_entries:
+                    rcid = safe_int(entry.get("roll_call_id"))
+                    vote_row = vote_row_lookup.get(rcid)
+                    if vote_row is not None:
+                        header_row = vote_row
+                        break
+            if header_row is None:
+                header_row_source = non_amendment_rows or bill_rows or [context_row]
+                header_row = header_row_source[0]
+            example_row = header_row
+            vote_dt = example_row.get("Date_dt")
+            if pd.isna(vote_dt):
+                display_date = (example_row.get("Date") or "").strip()
+            else:
+                display_date = vote_dt.strftime("%B %d, %Y")
+            vote_bucket = example_row.get("Vote Bucket", "")
+            vote_upper, vote_lower = _resolve_vote_phrases(vote_bucket)
             first_sentence = (
                 f"{display_date or 'Date unknown'}: {legislator_name} "
                 f"{vote_upper.title()} {bill_number}"
@@ -544,14 +897,47 @@ def _build_json_bullet_summary_doc(
             if bill_description:
                 paragraph.add_run(f"{legislator_name} {vote_lower} {bill_number}: \"{bill_description}.\" ")
 
+            summary_sentences: List[str] = []
+
+            if not roll_call_entries:
+                for row in non_amendment_rows:
+                    summary_sentences.append(
+                        _build_roll_call_sentence_from_row(
+                            row,
+                            None,
+                            legislator_name,
+                            bill_number,
+                        )
+                    )
+            else:
+                sorted_roll_calls = sorted(
+                    roll_call_entries,
+                    key=lambda entry: _parse_roll_call_datetime(entry.get("date")),
+                )
+                for entry in sorted_roll_calls:
+                    roll_call_id = safe_int(entry.get("roll_call_id"))
+                    vote_row = vote_row_lookup.get(roll_call_id)
+                    summary_sentences.append(
+                        _build_roll_call_sentence_from_entry(
+                            entry,
+                            vote_row,
+                            legislator_name,
+                            bill_number,
+                        )
+                    )
+
+            summary_sentences = [s for s in summary_sentences if s]
+            if summary_sentences:
+                paragraph.add_run(" ".join(summary_sentences) + " ")
+
             if last_action:
                 paragraph.add_run(f"Latest action: {last_action}. ")
-            paragraph.add_run(f"Outcome: {result_text}. ")
 
             paragraph.add_run("[")
-            paragraph.add_run(f"{state_label or 'State'} {chamber}, {bill_number}, ")
+            bracket_chamber = _normalize_chamber_label(context_row.get("Chamber"))
+            paragraph.add_run(f"{state_label or 'State'} {bracket_chamber}, {bill_number}, ")
             date_bracket = display_date or "Date unknown"
-            url = (row.get("URL") or "").strip()
+            url = (context_row.get("URL") or "").strip()
             if url:
                 _add_hyperlink(paragraph, url, date_bracket)
             else:
@@ -562,11 +948,171 @@ def _build_json_bullet_summary_doc(
     doc.save(buffer)
     buffer.seek(0)
     return buffer
+
+
+def _parse_roll_call_datetime(value: Optional[str]) -> dt.datetime:
+    if not value:
+        return dt.datetime.min
+    try:
+        return dt.datetime.fromisoformat(value)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return dt.datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return dt.datetime.min
+
+
+def _is_amendment_roll_call_entry(entry: Optional[Dict[str, object]]) -> bool:
+    if not entry:
+        return False
+    desc = (entry.get("desc") or "").strip().lower()
+    return "amendment" in desc
+
+
+def _is_amendment_row(row: pd.Series) -> bool:
+    details = str(row.get("Roll Details") or "").lower()
+    return "amendment" in details
+
+
+def _build_roll_call_sentence_from_row(
+    row: pd.Series,
+    entry: Optional[Dict[str, object]],
+    legislator_name: str,
+    bill_number: str,
+) -> str:
+    vote_dt = row.get("Date_dt")
+    if pd.isna(vote_dt):
+        display_date = (row.get("Date") or "").strip()
+    else:
+        display_date = vote_dt.strftime("%m/%d/%Y")
+    chamber = _normalize_chamber_label(row.get("Chamber"))
+    result_value = row.get("Result")
+    vote_summary_text = _format_vote_summary_counts(row)
+    if not vote_summary_text:
+        vote_summary_text = _format_roll_call_counts_entry(entry)
+    sentence = _format_roll_call_sentence(
+        display_date,
+        chamber,
+        result_value,
+        vote_summary_text,
+        bill_number,
+        entry,
+    )
+    vote_bucket = row.get("Vote Bucket", "")
+    _, vote_lower = _resolve_vote_phrases(vote_bucket)
+    if vote_lower:
+        sentence += f", {legislator_name} {vote_lower}."
+    else:
+        sentence += "."
+    return sentence
+
+
+def _build_roll_call_sentence_from_entry(
+    entry: Dict[str, object],
+    vote_row: Optional[pd.Series],
+    legislator_name: str,
+    bill_number: str,
+) -> str:
+    display_date = _format_json_date(entry.get("date"))
+    chamber = _normalize_chamber_label(
+        entry.get("chamber") or (vote_row.get("Chamber") if vote_row is not None else "")
+    )
+    result_value = 1 if safe_int(entry.get("passed")) == 1 else 0
+    vote_summary_text = _format_roll_call_counts_entry(entry)
+    sentence = _format_roll_call_sentence(
+        display_date,
+        chamber,
+        result_value,
+        vote_summary_text,
+        bill_number,
+        entry,
+    )
+    if vote_row is not None:
+        vote_bucket = vote_row.get("Vote Bucket", "")
+        _, vote_lower = _resolve_vote_phrases(vote_bucket)
+        sentence += f", {legislator_name} {vote_lower}."
+    else:
+        sentence += f" {legislator_name} did not cast a vote."
+    return sentence
+
 def safe_int(value: object) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _format_vote_summary_counts(row: pd.Series) -> Optional[str]:
+    required_cols = {"Total_For", "Total_Against", "Total_Not", "Total_Absent"}
+    if not required_cols.issubset(row.index):
+        return None
+    total_for = safe_int(row.get("Total_For"))
+    total_against = safe_int(row.get("Total_Against"))
+    total_not = safe_int(row.get("Total_Not"))
+    total_absent = safe_int(row.get("Total_Absent"))
+    total_sum = total_for + total_against + total_not + total_absent
+    if total_sum == 0:
+        return None
+    return f"{total_for}-{total_against}-{total_not}-{total_absent}"
+
+
+def _format_roll_call_counts_entry(entry: Optional[Dict[str, object]]) -> Optional[str]:
+    if not entry:
+        return None
+    total_for = safe_int(entry.get("yea"))
+    total_against = safe_int(entry.get("nay"))
+    total_not = safe_int(entry.get("nv"))
+    total_absent = safe_int(entry.get("absent"))
+    total_sum = total_for + total_against + total_not + total_absent
+    if total_sum == 0:
+        return None
+    return f"{total_for}-{total_against}-{total_not}-{total_absent}"
+
+
+def _format_roll_call_sentence(
+    display_date: Optional[str],
+    chamber: str,
+    result_value: object,
+    vote_summary_text: Optional[str],
+    bill_number: str,
+    roll_call_entry: Optional[Dict[str, object]],
+) -> str:
+    vote_date = display_date or "Date unknown"
+    chamber_label = chamber or "Chamber"
+    action = "pass" if safe_int(result_value) == 1 else "reject"
+    sentence = f"On {vote_date} the {chamber_label} voted to {action} {bill_number}"
+    if roll_call_entry:
+        desc = (roll_call_entry.get("desc") or "").strip()
+        if desc:
+            if "amendment" in desc.lower():
+                cleaned = desc.replace("Floor", "").strip()
+                sentence += f", {cleaned}"
+            else:
+                sentence += f", {desc}"
+    if vote_summary_text:
+        sentence += f", ({vote_summary_text})"
+    return sentence
+
+
+def _format_outcome_sentence(
+    display_date: str,
+    chamber: str,
+    bill_number: str,
+    result_value: object,
+    vote_summary_text: Optional[str],
+) -> str:
+    vote_date = display_date or "Date unknown"
+    chamber_label = _normalize_chamber_label(chamber)
+    normalized_bill = bill_number or "the bill"
+    action = "pass" if safe_int(result_value) == 1 else "reject"
+    sentence = f"On {vote_date} the {chamber_label} voted to {action} {normalized_bill}"
+    if vote_summary_text:
+        sentence += f", ({vote_summary_text})"
+    sentence += "."
+    return sentence
 
 
 def _apply_deciding_vote_filter(df: pd.DataFrame, max_vote_diff: int) -> pd.Series:
@@ -590,6 +1136,7 @@ def apply_filters_json(
     *,
     filter_mode: str,
     search_term: str = "",
+    bill_id_filters: Optional[List[str]] = None,
     year_selection: Optional[List[int]] = None,
     party_focus_option: str = "Legislator's Party",
     minority_percent: int = 20,
@@ -609,6 +1156,17 @@ def apply_filters_json(
             search_term, case=False, na=False
         )
         df = df[description_mask].copy()
+
+    if bill_id_filters:
+        normalized_ids = {
+            str(bill_id).strip()
+            for bill_id in bill_id_filters
+            if str(bill_id).strip()
+        }
+        if normalized_ids:
+            df = df[df["Bill ID"].astype(str).str.strip().isin(normalized_ids)].copy()
+            if df.empty:
+                raise ValueError("No vote records found for the provided Bill IDs.")
 
     if df.empty:
         raise ValueError("No vote records found for the selected criteria.")
@@ -633,8 +1191,8 @@ def apply_filters_json(
         sponsor_mask = sponsor_series.astype(str).str.strip() != ""
         df = df[sponsor_mask].copy()
         existing_keys: Set[Tuple[str, str]] = {
-            (str(session).strip(), str(bill_number).strip())
-            for session, bill_number in zip(df.get("Session", []), df.get("Bill Number", []))
+            (str(session).strip(), str(bill_id).strip())
+            for session, bill_id in zip(df.get("Session", []), df.get("Bill ID", []))
         }
         extra_rows: List[Dict[str, object]] = []
         if sponsor_metadata and selected_legislator:
@@ -787,10 +1345,281 @@ def apply_filters_json(
     return filtered_df, pre_filter_count
 
 
+def _merge_legislator_metadata(
+    multi_legislator_data: Dict[str, Dict[str, object]],
+    names: List[str],
+) -> Tuple[Dict[Tuple[str, str], Dict[str, object]], Dict[Tuple[str, str], List[Dict[str, object]]]]:
+    merged_sponsor: Dict[Tuple[str, str], Dict[str, object]] = {}
+    merged_bill_votes: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+    for name in names:
+        package = multi_legislator_data.get(name)
+        if not package:
+            continue
+        merged_sponsor.update(package.get("sponsor_metadata", {}))
+        merged_bill_votes.update(package.get("bill_vote_metadata", {}))
+    return merged_sponsor, merged_bill_votes
+
+
+def _resolve_mode_metadata(
+    has_comparison: bool,
+    overlap_mode: str,
+    overlap_requirement: str,
+) -> Tuple[str, str]:
+    if not has_comparison:
+        return "Single legislator", "solo"
+    if overlap_mode == "Combined (OR)":
+        return "Combined (union of legislators)", "combined"
+    if overlap_requirement == "Main + any":
+        return "Overlap (main + any additional)", "overlap_main_any"
+    return "Overlap (all legislators)", "overlap_all"
+
+
+def _normalize_bill_marker(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().upper()
+
+
+def _row_overlap_tokens(row: pd.Series) -> Set[Tuple]:
+    tokens: Set[Tuple] = set()
+    session_label = _normalize_bill_marker(row.get("Session"))
+    roll_call_id = safe_int(row.get("Roll Call ID"))
+    if roll_call_id:
+        tokens.add(("roll_call", roll_call_id))
+    bill_id = _normalize_bill_marker(row.get("Bill ID"))
+    if session_label and bill_id:
+        tokens.add(("bill_id", session_label, bill_id))
+    bill_number = _normalize_bill_marker(row.get("Bill Number"))
+    if session_label and bill_number:
+        tokens.add(("bill_number", session_label, bill_number))
+    crossfile_id = _normalize_bill_marker(row.get("Cross-file Bill ID"))
+    if session_label and crossfile_id:
+        tokens.add(("crossfile_id", session_label, crossfile_id))
+        tokens.add(("bill_id", session_label, crossfile_id))
+    crossfile_number = _normalize_bill_marker(row.get("Cross-file Bill Number"))
+    if session_label and crossfile_number:
+        tokens.add(("crossfile_number", session_label, crossfile_number))
+        tokens.add(("bill_number", session_label, crossfile_number))
+    return tokens
+
+
+def _apply_filters_for_package(
+    legislator_name: str,
+    package: Dict[str, object],
+    common_filter_kwargs: Dict[str, object],
+) -> Tuple[pd.DataFrame, int, List[Set[Tuple]], Set[Tuple], Dict[Tuple, Set[str]]]:
+    df = package.get("df")
+    if df is None:
+        raise ValueError(f"No vote dataset available for {legislator_name}.")
+    params = dict(common_filter_kwargs)
+    params["sponsor_metadata"] = package.get("sponsor_metadata")
+    params["selected_legislator"] = legislator_name
+    params["legislator_party_label"] = package.get("legislator_party_label", "")
+    filtered_df, total_count = apply_filters_json(df, **params)
+    row_tokens: List[Set[Tuple]] = []
+    combined_tokens: Set[Tuple] = set()
+    token_bucket_map: Dict[Tuple, Set[str]] = {}
+    for _, row in filtered_df.iterrows():
+        tokens = _row_overlap_tokens(row)
+        row_tokens.append(tokens)
+        combined_tokens.update(tokens)
+        vote_bucket = str(row.get("Vote Bucket") or "").strip().upper()
+        if not vote_bucket:
+            continue
+        for token in tokens:
+            bucket_set = token_bucket_map.setdefault(token, set())
+            bucket_set.add(vote_bucket)
+    return filtered_df, total_count, row_tokens, combined_tokens, token_bucket_map
+
+
+def _union_legislator_results(
+    primary_name: str,
+    comparison_legislators: List[str],
+    multi_legislator_data: Dict[str, Dict[str, object]],
+    common_filter_kwargs: Dict[str, object],
+) -> Tuple[pd.DataFrame, int]:
+    frames: List[pd.DataFrame] = []
+    total_count = 0
+    names = [primary_name] + comparison_legislators
+    for name in names:
+        package = multi_legislator_data.get(name)
+        if package is None:
+            continue
+        df_single, count_single = apply_filters_json(
+            package["df"],
+            **{
+                **common_filter_kwargs,
+                "sponsor_metadata": package.get("sponsor_metadata"),
+                "selected_legislator": name,
+                "legislator_party_label": package.get("legislator_party_label", ""),
+            },
+        )
+        if df_single.empty:
+            continue
+        frames.append(df_single)
+        total_count += len(df_single)
+    if not frames:
+        raise ValueError("No vote records found for the selected criteria.")
+    combined = (
+        pd.concat(frames, ignore_index=True)
+        .sort_values(by=["Date", "Bill Number", "Roll Call ID", "Person"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    return combined, total_count
+
+
+def _filter_with_legislator_overlap(
+    primary_name: str,
+    multi_legislator_data: Dict[str, Dict[str, object]],
+    comparison_legislators: List[str],
+    common_filter_kwargs: Dict[str, object],
+    *,
+    allow_overlap_with_any: bool = False,
+) -> Tuple[pd.DataFrame, int]:
+    primary_package = multi_legislator_data.get(primary_name)
+    if primary_package is None:
+        raise ValueError("Primary legislator dataset is unavailable. Regenerate the summary.")
+    (
+        primary_df,
+        total_count,
+        primary_row_tokens,
+        primary_token_set,
+        primary_token_bucket_map,
+    ) = _apply_filters_for_package(
+        primary_name,
+        primary_package,
+        common_filter_kwargs,
+    )
+    bucket_maps: Dict[str, Dict[Tuple, Set[str]]] = {primary_name: primary_token_bucket_map}
+    per_legislator_rows: Dict[str, Dict[str, object]] = {
+        primary_name: {
+            "df": primary_df,
+            "row_tokens": primary_row_tokens,
+        }
+    }
+    if not comparison_legislators:
+        return primary_df, total_count
+    if allow_overlap_with_any:
+        overlap_tokens: Set[Tuple] = set()
+        if not primary_token_set:
+            raise ValueError(
+                "No qualifying roll-call or cross-file identifiers found for the primary legislator."
+            )
+    else:
+        overlap_tokens = set(primary_token_set)
+        if not overlap_tokens:
+            raise ValueError(
+                "No qualifying roll-call or cross-file identifiers found for the primary legislator."
+            )
+    for comp_name in comparison_legislators:
+        package = multi_legislator_data.get(comp_name)
+        if package is None:
+            raise ValueError(f"No cached dataset available for {comp_name}. Regenerate the summary.")
+        (
+            comp_df,
+            _,
+            comp_row_tokens,
+            comp_tokens,
+            comp_bucket_map,
+        ) = _apply_filters_for_package(comp_name, package, common_filter_kwargs)
+        bucket_maps[comp_name] = comp_bucket_map
+        per_legislator_rows[comp_name] = {
+            "df": comp_df,
+            "row_tokens": comp_row_tokens,
+        }
+        comp_overlap = primary_token_set & comp_tokens
+        if allow_overlap_with_any:
+            overlap_tokens |= comp_overlap
+        else:
+            overlap_tokens &= comp_tokens
+        if not overlap_tokens:
+            break
+    if not overlap_tokens:
+        raise ValueError(
+            "No overlapping votes found for the selected legislators with the current filters."
+        )
+    filter_mode = common_filter_kwargs.get("filter_mode")
+    if comparison_legislators and filter_mode == "All Votes":
+        def _matching_vote(token: Tuple) -> bool:
+            consensus = None
+            participants = [primary_name]
+            if allow_overlap_with_any:
+                participants += [
+                    name for name in comparison_legislators if token in bucket_maps.get(name, {})
+                ]
+            else:
+                participants += comparison_legislators
+            for name in participants:
+                token_buckets = bucket_maps.get(name, {}).get(token)
+                if not token_buckets:
+                    return False
+                normalized = {bucket.strip().upper() for bucket in token_buckets if bucket}
+                if not normalized:
+                    return False
+                if len(normalized) > 1:
+                    return False
+                bucket_value = next(iter(normalized))
+                if consensus is None:
+                    consensus = bucket_value
+                elif bucket_value != consensus:
+                    return False
+            return True
+
+        overlap_tokens = {token for token in overlap_tokens if _matching_vote(token)}
+        if not overlap_tokens:
+            raise ValueError(
+                "No overlapping votes found where all selected legislators cast the same vote."
+            )
+    combined_frames: List[pd.DataFrame] = []
+    def _build_subset(name: str) -> Optional[pd.DataFrame]:
+        entry = per_legislator_rows.get(name)
+        if entry is None:
+            return None
+        tokens_list = entry["row_tokens"]
+        df = entry["df"]
+        local_mask = [
+            bool(token_set & overlap_tokens)
+            for token_set in tokens_list
+        ]
+        if not local_mask:
+            return None
+        subset = df.loc[local_mask].copy()
+        if subset.empty:
+            return None
+        return subset
+
+    sequence = [primary_name] + comparison_legislators
+    for name in sequence:
+        subset = _build_subset(name)
+        if subset is not None and not subset.empty:
+            combined_frames.append(subset)
+
+    if not combined_frames:
+        raise ValueError(
+            "Overlapping votes were identified, but none remained after applying all filters."
+        )
+    filtered_subset = pd.concat(combined_frames, ignore_index=True)
+    filtered_subset = filtered_subset.sort_values(
+        by=["Date", "Bill Number", "Roll Call ID", "Person"],
+        kind="mergesort",
+        na_position="last",
+    ).reset_index(drop=True)
+    return filtered_subset, total_count
+
+
 def main() -> None:
     st.set_page_config(page_title="LegiScan JSON Vote Explorer", layout="wide")
     st.title("LegiScan JSON Vote Explorer (JSON Beta)")
     st.caption("Load LegiScan JSON archives by state, pick a legislator, and download their vote history.")
+    with st.expander("How this workflow works", expanded=False):
+        st.markdown(
+            """
+            1. **Pick state archives** in the sidebar. When remote storage is configured, the app only downloads the ZIPs for the states you select.
+            2. **Choose a legislator and view** (All Votes, Votes Against Party, Sponsored Bills, etc.), then click **Generate summary** to cache the dataset.
+            3. **Filter & explore** using year, search term, minority/deciding controls, and review the live table to confirm the subset you need.
+            4. **Export results** with the download buttons: the current filtered sheet, a Word bullet summary, or the multi-view workbook.
+            """
+        )
 
     state_labels, state_codes = _render_state_filter()
     if not state_codes:
@@ -811,12 +1640,10 @@ def main() -> None:
         st.error(str(exc))
         st.stop()
 
+    paths_snapshot = tuple(str(path) for path in selected_paths)
     with st.spinner("Discovering legislators..."):
-        try:
-            legislator_names, dataset_state = _load_legislator_names(selected_paths)
-        except Exception as exc:
-            st.error(f"Failed to read archives: {exc}")
-            st.stop()
+        legislator_names, dataset_state = load_legislators_for_archives(paths_snapshot)
+
 
     if not legislator_names:
         st.warning("No legislators found in the selected archives.")
@@ -838,6 +1665,33 @@ def main() -> None:
         index=0,
         key="json_legislator_select",
     )
+    comparison_options = [name for name in legislator_names if name != selected_legislator]
+    additional_legislators = st.sidebar.multiselect(
+        "Additional legislators (overlap)",
+        options=comparison_options,
+        key="json_additional_legislators",
+        help="Limit results to votes shared with these legislators (same roll call and filters).",
+    )
+    if additional_legislators:
+        overlap_mode = st.sidebar.radio(
+            "Multi-legislator mode",
+            options=["Overlap (AND)", "Combined (OR)"],
+            index=0,
+            key="json_overlap_mode",
+            help="AND = only votes shared by every selected legislator; OR = concatenate each legislator's matching votes.",
+        )
+        overlap_requirement = "All legislators"
+        if overlap_mode == "Overlap (AND)":
+            overlap_requirement = st.sidebar.radio(
+                "Overlap requirement",
+                options=["All legislators", "Main + any"],
+                index=0,
+                key="json_overlap_requirement",
+                help="Require votes shared by all selected legislators, or just the main legislator plus any additional member.",
+            )
+    else:
+        overlap_mode = "Overlap (AND)"
+        overlap_requirement = "All legislators"
 
     filter_mode = st.sidebar.selectbox(
         "Vote type",
@@ -850,6 +1704,18 @@ def main() -> None:
         "Search term (bill description)",
         value="",
         key="json_search_term",
+    )
+    bill_id_filter_text = st.sidebar.text_area(
+        "Bill IDs (optional)",
+        value="",
+        key="json_bill_id_filter",
+        help="Comma or newline separated list of Bill IDs to include.",
+    )
+    bill_id_filters = _parse_bill_id_list(bill_id_filter_text)
+    bullet_amendments = st.sidebar.checkbox(
+        "Bullet bill amendments?",
+        value=False,
+        help="Include amendment roll-call votes when building the bullet summary.",
     )
 
     party_focus_option = "Legislator's Party"
@@ -917,33 +1783,39 @@ def main() -> None:
     elif filter_mode == "Sponsored/Cosponsored Bills":
         st.sidebar.caption("Shows votes on bills the legislator sponsored or co-sponsored.")
 
-    control_cols = st.columns(2)
-    with control_cols[0]:
-        generate_summary = st.button("Generate summary", type="primary")
-    with control_cols[1]:
-        generate_workbook_clicked = st.button("Generate all views workbook")
+    generate_summary = st.button("Generate summary", type="primary")
 
     sponsor_metadata: Dict[Tuple[str, str], Dict[str, object]] = {}
     legislator_party_label = ""
 
     if generate_summary:
-        with st.spinner(f"Compiling votes for {selected_legislator}..."):
-            try:
-                rows = _build_vote_rows(selected_paths, selected_legislator)
-            except Exception as exc:
-                st.error(f"Failed to build vote summary: {exc}")
-                st.stop()
-        summary_df = _prepare_dataframe(rows)
-        sponsor_lookup, sponsor_metadata, legislator_party_label = _collect_sponsor_lookup_json(
-            selected_paths,
-            selected_legislator,
-        )
-        session_series = summary_df["Session"].astype(str)
-        bill_number_series = summary_df["Bill Number"].astype(str)
-        summary_df["Sponsorship Status"] = [
-            sponsor_lookup.get((session, bill_number), "")
-            for session, bill_number in zip(session_series, bill_number_series)
+        participants = [selected_legislator] + [
+            name for name in additional_legislators if name != selected_legislator
         ]
+        targets = participants.copy()
+        seen_targets: Set[str] = set()
+        ordered_targets: List[str] = []
+        for name in targets:
+            if name and name not in seen_targets:
+                ordered_targets.append(name)
+                seen_targets.add(name)
+        multi_legislator_data: Dict[str, Dict[str, object]] = {}
+        for name in ordered_targets:
+            with st.spinner(f"Compiling votes for {name}..."):
+                try:
+                    package = _build_legislator_dataset(selected_paths, name)
+                except Exception as exc:
+                    st.error(f"Failed to build vote summary for {name}: {exc}")
+                    st.stop()
+            multi_legislator_data[name] = package
+        primary_package = multi_legislator_data[selected_legislator]
+        rows = primary_package["rows"]
+        summary_df = primary_package["df"]
+        sponsor_metadata, bill_vote_metadata = _merge_legislator_metadata(
+            multi_legislator_data,
+            participants,
+        )
+        legislator_party_label = primary_package.get("legislator_party_label", "")
         st.session_state[SESSION_CACHE_KEY] = {
             "rows": rows,
             "df": summary_df,
@@ -951,22 +1823,62 @@ def main() -> None:
             "archives": archives_snapshot,
             "sponsor_metadata": sponsor_metadata,
             "legislator_party_label": legislator_party_label,
+            "bill_vote_metadata": bill_vote_metadata,
+            "multi_legislator_data": multi_legislator_data,
+            "merged_participants": participants,
+            "additional_legislators": additional_legislators,
         }
 
     cached = st.session_state.get(SESSION_CACHE_KEY)
     if cached:
         if cached.get("archives") != archives_snapshot or cached.get("legislator") not in legislator_names:
             cached = None
+        else:
+            cached_compare = set(cached.get("additional_legislators", []))
+            if cached_compare != set(additional_legislators):
+                cached = None
 
     if not cached:
         st.info("Click **Generate summary** to build the vote dataset.")
         st.stop()
 
-    rows = cached["rows"]
-    summary_df = cached["df"]
     legislator = cached["legislator"]
-    sponsor_metadata = cached.get("sponsor_metadata", {})
-    legislator_party_label = cached.get("legislator_party_label", "")
+    multi_legislator_data: Dict[str, Dict[str, object]] = cached.get("multi_legislator_data") or {}
+    if not multi_legislator_data:
+        multi_legislator_data = {
+            legislator: {
+                "rows": cached.get("rows", []),
+                "df": cached.get("df"),
+                "sponsor_metadata": cached.get("sponsor_metadata", {}),
+                "legislator_party_label": cached.get("legislator_party_label", ""),
+                "bill_vote_metadata": cached.get("bill_vote_metadata", {}),
+            }
+        }
+    primary_package = multi_legislator_data.get(legislator)
+    if primary_package is None:
+        primary_package = {
+            "rows": cached.get("rows", []),
+            "df": cached.get("df"),
+            "sponsor_metadata": cached.get("sponsor_metadata", {}),
+            "legislator_party_label": cached.get("legislator_party_label", ""),
+            "bill_vote_metadata": cached.get("bill_vote_metadata", {}),
+        }
+        multi_legislator_data[legislator] = primary_package
+        cached["multi_legislator_data"] = multi_legislator_data
+        st.session_state[SESSION_CACHE_KEY] = cached
+    rows = primary_package.get("rows", [])
+    summary_df = primary_package.get("df")
+    cached_participants = cached.get("merged_participants")
+    if not cached_participants:
+        cached_participants = [legislator] + cached.get("additional_legislators", [])
+    sponsor_metadata = cached.get("sponsor_metadata")
+    bill_vote_metadata = cached.get("bill_vote_metadata")
+    if sponsor_metadata is None or bill_vote_metadata is None:
+        sponsor_metadata, bill_vote_metadata = _merge_legislator_metadata(
+            multi_legislator_data,
+            cached_participants,
+        )
+    legislator_party_label = primary_package.get("legislator_party_label", "")
     if "Sponsorship Status" not in summary_df.columns:
         summary_df["Sponsorship Status"] = ""
 
@@ -990,28 +1902,57 @@ def main() -> None:
     )
     st.session_state["json_year_selection"] = year_selection
 
+    comparison_legislators = [
+        name for name in additional_legislators if name in multi_legislator_data
+    ]
+    common_filter_kwargs = {
+        "filter_mode": filter_mode,
+        "search_term": search_term,
+        "bill_id_filters": bill_id_filters,
+        "year_selection": year_selection,
+        "party_focus_option": party_focus_option,
+        "minority_percent": minority_percent,
+        "min_group_votes": min_group_votes,
+        "max_vote_diff": max_vote_diff,
+    }
+    allow_overlap_with_any = overlap_requirement == "Main + any"
+    mode_description, mode_slug = _resolve_mode_metadata(
+        bool(comparison_legislators),
+        overlap_mode,
+        overlap_requirement,
+    )
     try:
-        filtered_df, total_count = apply_filters_json(
-            summary_df,
-            filter_mode=filter_mode,
-            search_term=search_term,
-            year_selection=year_selection,
-            party_focus_option=party_focus_option,
-            minority_percent=minority_percent,
-            min_group_votes=min_group_votes,
-            max_vote_diff=max_vote_diff,
-            sponsor_metadata=sponsor_metadata,
-            selected_legislator=legislator,
-            legislator_party_label=legislator_party_label,
-        )
+        if comparison_legislators and overlap_mode == "Combined (OR)":
+            filtered_df, total_count = _union_legislator_results(
+                legislator,
+                comparison_legislators,
+                multi_legislator_data,
+                common_filter_kwargs,
+            )
+        else:
+            filtered_df, total_count = _filter_with_legislator_overlap(
+                legislator,
+                multi_legislator_data,
+                comparison_legislators,
+                common_filter_kwargs,
+                allow_overlap_with_any=allow_overlap_with_any,
+            )
     except ValueError as exc:
         st.warning(str(exc))
         st.stop()
 
     filtered_count = len(filtered_df)
+    overlap_note = f" [{mode_description}]"
+    if comparison_legislators:
+        if overlap_mode == "Combined (OR)":
+            overlap_note += f" (combined with {len(comparison_legislators)} additional legislators)"
+        elif allow_overlap_with_any:
+            overlap_note += f" (overlap across main legislator plus any of {len(comparison_legislators)} others)"
+        else:
+            overlap_note += f" (overlap across {1 + len(comparison_legislators)} legislators)"
     st.success(
         f"Compiled {total_count} votes for {legislator}. "
-        f"Showing {filtered_count} after filters."
+        f"Showing {filtered_count} after filters{overlap_note}."
     )
 
     display_df = filtered_df.copy()
@@ -1037,10 +1978,14 @@ def main() -> None:
     excel_rows = export_df.values.tolist()
     excel_buffer = io.BytesIO()
     write_workbook(excel_rows, legislator, excel_buffer)
+    votes_filename = f"{legislator.replace(' ', '_')}_JSON_Votes"
+    if mode_slug != "solo":
+        votes_filename += f"_{mode_slug}"
+    votes_filename += ".xlsx"
     st.download_button(
         label="Download filtered Excel sheet",
         data=excel_buffer.getvalue(),
-        file_name=f"{legislator.replace(' ', '_')}_JSON_Votes.xlsx",
+        file_name=votes_filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     if not filtered_df.empty:
@@ -1049,13 +1994,23 @@ def main() -> None:
             legislator,
             filter_mode,
             state_display,
+            bill_vote_metadata=bill_vote_metadata,
+            full_summary_df=summary_df,
+            include_amendments=bullet_amendments,
         )
         st.download_button(
             label="Download bullet summary",
             data=bullet_buffer.getvalue(),
-            file_name=f"{legislator.replace(' ', '_')}_{filter_mode.replace('/', '_').replace(' ', '_')}_summary.docx",
+            file_name=f"{legislator.replace(' ', '_')}_{filter_mode.replace('/', '_').replace(' ', '_')}_{mode_slug}_summary.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             key="json_bullet_summary_download",
+        )
+    generate_workbook_clicked = False
+    if not filtered_df.empty:
+        generate_workbook_clicked = st.button(
+            "Generate all views workbook",
+            key="json_full_workbook_button",
+            help="Compile each predefined view into a single Excel workbook.",
         )
 
     if generate_workbook_clicked:
@@ -1070,14 +2025,12 @@ def main() -> None:
 
         base_params = {
             "search_term": "",
+            "bill_id_filters": bill_id_filters,
             "year_selection": year_selection or None,
             "party_focus_option": "Legislator's Party",
             "minority_percent": 20,
             "min_group_votes": 0,
             "max_vote_diff": 5,
-            "sponsor_metadata": sponsor_metadata,
-            "selected_legislator": legislator,
-            "legislator_party_label": legislator_party_label,
         }
 
         for view_name in WORKBOOK_VIEWS:
@@ -1100,11 +2053,25 @@ def main() -> None:
             elif view_name == "Deciding Votes":
                 params.update({"max_vote_diff": stored_deciding_max_diff})
             try:
-                sheet_df, _ = apply_filters_json(
-                    summary_df,
-                    filter_mode=view_name,
+                view_filter_kwargs = {
+                    "filter_mode": view_name,
                     **params,
-                )
+                }
+                if comparison_legislators and overlap_mode == "Combined (OR)":
+                    sheet_df, _ = _union_legislator_results(
+                        legislator,
+                        comparison_legislators,
+                        multi_legislator_data,
+                        view_filter_kwargs,
+                    )
+                else:
+                    sheet_df, _ = _filter_with_legislator_overlap(
+                        legislator,
+                        multi_legislator_data,
+                        comparison_legislators,
+                        view_filter_kwargs,
+                        allow_overlap_with_any=overlap_requirement == "Main + any",
+                    )
             except ValueError:
                 empty_views.append(view_name)
                 continue
@@ -1121,10 +2088,14 @@ def main() -> None:
             workbook_buffer = io.BytesIO()
             write_multi_sheet_workbook(workbook_views, workbook_buffer)
             workbook_buffer.seek(0)
+            workbook_filename = f"{legislator.replace(' ', '_')}_JSON_full_workbook"
+            if mode_slug != "solo":
+                workbook_filename += f"_{mode_slug}"
+            workbook_filename += ".xlsx"
             st.download_button(
                 label="Download vote summary workbook",
                 data=workbook_buffer.getvalue(),
-                file_name=f"{legislator.replace(' ', '_')}_JSON_full_workbook.xlsx",
+                file_name=workbook_filename,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="json_full_workbook_download",
             )
