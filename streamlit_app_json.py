@@ -856,6 +856,12 @@ def _build_json_bullet_summary_doc(
     normal_style = doc.styles["Normal"]
     normal_style.font.name = "Arial"
     normal_style.font.size = Pt(10)
+    normal_style._element.rPr.rFonts.set(qn("w:eastAsia"), "Arial")
+
+    heading_style = doc.styles["Heading 1"]
+    heading_style.font.name = "Arial"
+    heading_style.font.size = Pt(10)
+    heading_style._element.rPr.rFonts.set(qn("w:eastAsia"), "Arial")
 
     doc.add_heading(f"{legislator_name} - {filter_label}", level=1)
 
@@ -1007,6 +1013,11 @@ def _build_json_bullet_summary_doc(
             else:
                 paragraph.add_run(date_bracket)
             paragraph.add_run("]")
+
+            # Provide an explicit blank line between entries for readability.
+            blank_line = doc.add_paragraph("")
+            blank_line.paragraph_format.space_before = Pt(0)
+            blank_line.paragraph_format.space_after = Pt(0)
 
     buffer = io.BytesIO()
     doc.save(buffer)
