@@ -5,7 +5,7 @@ import tempfile
 import datetime as dt
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import pandas as pd
 import streamlit as st
@@ -417,6 +417,14 @@ def _parse_json_date_to_date(value: Optional[str]) -> Optional[dt.date]:
         return None
 
 
+def _format_short_us_date(date_value: Union[dt.date, dt.datetime]) -> str:
+    if isinstance(date_value, dt.datetime):
+        date_value = date_value.date()
+    if not isinstance(date_value, dt.date):
+        return ""
+    return f"{date_value.month}/{date_value.day}/{str(date_value.year)[-2:]}"
+
+
 def _latest_bill_action_date(bill: dict) -> Optional[dt.date]:
     latest_date: Optional[dt.date] = None
     history_entries = bill.get("history") or []
@@ -483,11 +491,9 @@ def _normalize_party_label(party_code: Optional[str]) -> str:
 def _format_json_date(date_str: Optional[str]) -> str:
     if not date_str:
         return ""
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d"):
-        try:
-            return dt.datetime.strptime(date_str, fmt).strftime("%m/%d/%Y")
-        except ValueError:
-            continue
+    parsed = _parse_json_date_to_date(date_str)
+    if parsed:
+        return _format_short_us_date(parsed)
     return date_str
 
 
@@ -810,18 +816,10 @@ def _format_docx_date(date_value: str) -> str:
     text = (date_value or "").strip()
     if not text:
         return text
-    date_formats = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y")
-    for fmt in date_formats:
-        try:
-            parsed = dt.datetime.strptime(text, fmt)
-            return f"{parsed.month}/{parsed.day}/{str(parsed.year)[-2:]}"
-        except ValueError:
-            continue
-    try:
-        parsed = dt.datetime.fromisoformat(text)
-        return f"{parsed.month}/{parsed.day}/{str(parsed.year)[-2:]}"
-    except ValueError:
-        return text
+    parsed = _parse_json_date_to_date(text)
+    if parsed:
+        return _format_short_us_date(parsed)
+    return text
 
 
 def _resolve_vote_phrases(vote_bucket: str) -> Tuple[str, str]:
@@ -844,6 +842,7 @@ def _build_json_bullet_summary_doc(
     bill_vote_metadata: Optional[Dict[Tuple[str, str], List[Dict[str, object]]]] = None,
     full_summary_df: Optional[pd.DataFrame] = None,
     include_amendments: bool = False,
+    suppress_vote_counts: bool = False,
 ) -> io.BytesIO:
     bill_vote_metadata = bill_vote_metadata or {}
     doc = Document()
@@ -900,6 +899,8 @@ def _build_json_bullet_summary_doc(
                 roll_call_identifier = safe_int(src_row.get("Roll Call ID"))
                 if roll_call_identifier:
                     vote_row_lookup[roll_call_identifier] = src_row
+
+        include_counts = not suppress_vote_counts
 
         for key in ordered_bill_keys:
             context_row = bill_context_row.get(key)
@@ -977,6 +978,7 @@ def _build_json_bullet_summary_doc(
                             None,
                             legislator_name,
                             bill_number,
+                            include_counts=include_counts,
                         )
                     )
             else:
@@ -993,6 +995,7 @@ def _build_json_bullet_summary_doc(
                             vote_row,
                             legislator_name,
                             bill_number,
+                            include_counts=include_counts,
                         )
                     )
 
@@ -1057,6 +1060,8 @@ def _build_roll_call_sentence_from_row(
     entry: Optional[Dict[str, object]],
     legislator_name: str,
     bill_number: str,
+    *,
+    include_counts: bool = True,
 ) -> str:
     vote_dt = row.get("Date_dt")
     if pd.isna(vote_dt):
@@ -1065,9 +1070,11 @@ def _build_roll_call_sentence_from_row(
         display_date = vote_dt.strftime("%m/%d/%Y")
     chamber = _normalize_chamber_label(row.get("Chamber"))
     result_value = row.get("Result")
-    vote_summary_text = _format_vote_summary_counts(row)
-    if not vote_summary_text:
-        vote_summary_text = _format_roll_call_counts_entry(entry)
+    vote_summary_text = None
+    if include_counts:
+        vote_summary_text = _format_vote_summary_counts(row)
+        if not vote_summary_text:
+            vote_summary_text = _format_roll_call_counts_entry(entry)
     sentence = _format_roll_call_sentence(
         display_date,
         chamber,
@@ -1090,13 +1097,15 @@ def _build_roll_call_sentence_from_entry(
     vote_row: Optional[pd.Series],
     legislator_name: str,
     bill_number: str,
+    *,
+    include_counts: bool = True,
 ) -> str:
     display_date = _format_json_date(entry.get("date"))
     chamber = _normalize_chamber_label(
         entry.get("chamber") or (vote_row.get("Chamber") if vote_row is not None else "")
     )
     result_value = 1 if safe_int(entry.get("passed")) == 1 else 0
-    vote_summary_text = _format_roll_call_counts_entry(entry)
+    vote_summary_text = _format_roll_call_counts_entry(entry) if include_counts else None
     sentence = _format_roll_call_sentence(
         display_date,
         chamber,
@@ -1816,6 +1825,11 @@ def main() -> None:
         value=False,
         help="Include amendment roll-call votes when building the bullet summary.",
     )
+    show_absent_only = st.sidebar.checkbox(
+        "Show absent/no-vote information?",
+        value=False,
+        help="Filter the current view to votes where the selected legislator was marked Absent or Not Voting.",
+    )
 
     party_focus_option = "Legislator's Party"
     minority_percent = 20
@@ -2040,6 +2054,16 @@ def main() -> None:
         st.warning(str(exc))
         st.stop()
 
+    if show_absent_only:
+        vote_bucket_series = filtered_df.get("Vote Bucket", pd.Series([], dtype="object"))
+        absent_mask = (
+            vote_bucket_series.astype(str).str.strip().str.lower().isin({"absent", "not"})
+        )
+        filtered_df = filtered_df[absent_mask].copy()
+        if filtered_df.empty:
+            st.warning("No absent or no-vote records found for the selected criteria.")
+            st.stop()
+
     filtered_count = len(filtered_df)
     overlap_note = f" [{mode_description}]"
     if comparison_legislators:
@@ -2096,6 +2120,7 @@ def main() -> None:
             bill_vote_metadata=bill_vote_metadata,
             full_summary_df=summary_df,
             include_amendments=bullet_amendments,
+            suppress_vote_counts=show_absent_only,
         )
         st.download_button(
             label="Download bullet summary",
