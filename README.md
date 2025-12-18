@@ -15,7 +15,6 @@ The CLI workflow consumes LegiScan JSON archives (directories named `bill/`, `pe
 
 ### Remote JSON Archives (GCS Beta)
 Set these environment variables (or add them to .streamlit/secrets.toml) to source archives from Google Cloud Storage:
-
  - ILLUMIS_GCS_BUCKET - bucket that stores the JSON ZIPs and manifest.
  - ILLUMIS_GCS_MANIFEST - optional blob name (default manifest.json) listing archives per state.
  - ILLUMIS_ARCHIVE_CACHE_DIR - optional local cache directory for downloaded ZIPs (defaults to the system temp dir).
