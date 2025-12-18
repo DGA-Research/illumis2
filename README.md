@@ -13,6 +13,14 @@ Use whichever workflow fits your data ingestion process, or combine both for bro
 
 The CLI workflow consumes LegiScan JSON archives (directories named `bill/`, `people/`, and `vote/`) and produces an Excel workbook for a single legislator.
 
+### Remote JSON Archives (GCS Beta)
+Set these environment variables (or add them to .streamlit/secrets.toml) to source archives from Google Cloud Storage:
+
+ILLUMIS_GCS_BUCKET - bucket that stores the JSON ZIPs and manifest.
+ILLUMIS_GCS_MANIFEST - optional blob name (default manifest.json) listing archives per state.
+ILLUMIS_ARCHIVE_CACHE_DIR - optional local cache directory for downloaded ZIPs (defaults to the system temp dir).
+When present, the app lists archives per selected state by reading the manifest, downloads only the needed ZIPs into the cache, and reuses them until the manifest reports a newer updated value.
+
 ### Highlights
 - Accepts one or more LegiScan JSON ZIP archives from the same state and extracts them into temporary staging areas.
 - Automatically discovers every session directory that includes `bill`, `people`, and `vote` subfolders, ensuring only complete datasets are processed.
