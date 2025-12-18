@@ -9,6 +9,10 @@ Use whichever workflow fits your data ingestion process, or combine both for bro
 
 ---
 
+## Streamlt Hosted App Link:
+https://illumis2-gev8nx3exq5m3c9hj8xxld.streamlit.app/
+
+
 ## JSON Vote Exporter CLI
 
 The CLI workflow consumes LegiScan JSON archives (directories named `bill/`, `people/`, and `vote/`) and produces an Excel workbook for a single legislator.
